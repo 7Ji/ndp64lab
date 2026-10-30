@@ -1,0 +1,260 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+generated=$here/.generated
+prefix=ndp64lab
+label="org.ndp64lab.owner=$prefix"
+builder=ndp64labbuilder
+router_image=ndp64labrouter:24.10.4
+peer_image=ndp64labpeer:3.20
+rootfs=openwrt-24.10.4-x86-64-rootfs.tar.gz
+rootfs_url="https://downloads.openwrt.org/releases/24.10.4/targets/x86/64/$rootfs"
+
+die() { printf 'lab: %s\n' "$*" >&2; exit 1; }
+note() { printf 'lab: %s\n' "$*" >&2; }
+require_no_args() { (( $# == 0 )) || die "$applet takes no arguments"; }
+container() { printf '%s%s' "$prefix" "$1"; }
+network() { printf '%s%s' "$prefix" "$1"; }
+dc() { docker exec "$(container "$1")" "${@:2}"; }
+router_mac_matches() { [[ $(dc router cat "/sys/class/net/eth$1/address" 2>/dev/null) == "$2" ]]; }
+require_tools() {
+  [[ $(uname -sm) == 'Linux x86_64' ]] || die 'requires Linux x86_64'
+  local tool
+  for tool in docker curl sha256sum; do command -v "$tool" >/dev/null || die "missing $tool"; done
+  docker info >/dev/null || die 'Docker Engine is unavailable'
+  docker buildx version >/dev/null || die 'Docker buildx is unavailable'
+}
+owned_container() {
+  [[ $(docker inspect -f '{{index .Config.Labels "org.ndp64lab.owner"}}' "$1" 2>/dev/null) == "$prefix" ]]
+}
+owned_network() {
+  [[ $(docker network inspect -f '{{index .Labels "org.ndp64lab.owner"}}' "$1" 2>/dev/null) == "$prefix" ]]
+}
+check_name_free() {
+  local name=$1
+  if docker container inspect "$name" >/dev/null 2>&1; then
+    owned_container "$name" || die "container name $name belongs to another owner"
+    die "lab already exists; run ./lab reset"
+  fi
+}
+check_image_owned_or_free() {
+  local owner
+  owner=$(docker image inspect -f '{{index .Config.Labels "org.ndp64lab.owner"}}' "$1" 2>/dev/null) || return 0
+  [[ $owner == "$prefix" ]] || die "image tag $1 belongs to another owner"
+}
+wait_for() {
+  local description=$1 command=$2 deadline=$((SECONDS + 60))
+  until eval "$command" >/dev/null 2>&1; do
+    (( SECONDS < deadline )) || die "timed out waiting for $description"
+    sleep 1
+  done
+}
+download_rootfs() {
+  mkdir -p "$generated"
+  if ! (cd "$generated" && sha256sum -c "$here/rootfs.sha256" >/dev/null 2>&1); then
+    note 'downloading pinned OpenWrt rootfs'
+    curl --fail --location --retry 3 --output "$generated/$rootfs" "$rootfs_url"
+    (cd "$generated" && sha256sum -c "$here/rootfs.sha256") || die 'rootfs checksum mismatch'
+  fi
+}
+build_images() {
+  download_rootfs
+  if [[ ! -e "$generated/builder-owned" ]]; then
+    docker buildx inspect "$builder" >/dev/null 2>&1 && die "builder $builder exists without ownership marker"
+    touch "$generated/builder-owned"
+    docker buildx create --name "$builder" --driver docker-container >/dev/null
+  fi
+  docker buildx build --builder "$builder" --load --build-arg "LAB_ID=$prefix" -f "$here/Dockerfile.peer" -t "$peer_image" "$here"
+  docker buildx build --builder "$builder" --load --build-arg "LAB_ID=$prefix" -f "$here/Dockerfile.router" -t "$router_image" "$here"
+}
+create_networks() {
+  local segment
+  for segment in wan {1..8}; do
+    local name; name=$(network "$segment")
+    docker network inspect "$name" >/dev/null 2>&1 && die "network $name already exists"
+    docker network create --internal --driver bridge --label "$label" "$name" >/dev/null
+  done
+}
+start_peers() {
+  docker run -d --privileged --name "$(container isp)" --label "$label" \
+    --network "$(network wan)" --mac-address 02:42:ac:20:00:01 "$peer_image" >/dev/null
+  local n name mac
+  for n in {1..8}; do
+    printf -v mac '02:42:ac:10:%02x:0a' "$n"
+    name="client$n"
+    docker run -d --privileged --name "$(container "$name")" --label "$label" \
+      --network "$(network "$n")" --mac-address "$mac" "$peer_image" >/dev/null
+  done
+  docker run -d --privileged --name "$(container client1b)" --label "$label" \
+    --network "$(network 1)" --mac-address 02:42:ac:10:01:0b "$peer_image" >/dev/null
+}
+start_router() {
+  docker create --privileged --name "$(container router)" --label "$label" \
+    --volume "$generated:/lab:ro" \
+    --network "$(network wan)" --mac-address 02:42:ac:00:00:00 "$router_image" >/dev/null
+  local n mac
+  for n in {1..8}; do
+    docker network connect --alias "router$n" "$(network "$n")" "$(container router)"
+  done
+  : > "$generated/interfaces.tmp"
+  docker start "$(container router)" >/dev/null
+  for n in {0..8}; do
+    if (( n == 0 )); then mac=$(docker inspect -f "{{(index .NetworkSettings.Networks \"$(network wan)\").MacAddress}}" "$(container router)");
+    else mac=$(docker inspect -f "{{(index .NetworkSettings.Networks \"$(network "$n")\").MacAddress}}" "$(container router)"); fi
+    [[ $mac =~ ^[[:xdigit:]:]{17}$ ]] || die "missing MAC for router LAN$n"
+    printf '%s %s\n' "$n" "$mac" >> "$generated/interfaces.tmp"
+  done
+  mv "$generated/interfaces.tmp" "$generated/interfaces"
+  for n in {0..8}; do
+    mac=$(awk -v n="$n" '$1 == n {print $2}' "$generated/interfaces")
+    wait_for "router eth$n MAC $mac" "router_mac_matches $n $mac"
+  done
+  wait_for 'OpenWrt helper' 'dc router pidof lab-ndp'
+  wait_for 'OpenWrt firewall' 'dc router nft list table inet fw4'
+}
+configure_peers() {
+  local n name
+  dc isp sysctl -w net.ipv6.conf.eth0.disable_ipv6=0 >/dev/null
+  dc isp ip -4 addr flush dev eth0
+  dc isp ip -4 addr add 198.18.0.1/30 dev eth0
+  dc isp ip -6 addr add fe80::1/64 dev eth0
+  dc isp ip -6 addr add fd42:6e64:7000:1::1/64 dev eth0
+  dc isp ip -6 addr add fd42:6e64:7000:2::2/128 dev lo
+  for n in {1..8}; do
+    name="client$n"
+    dc "$name" sysctl -w net.ipv6.conf.eth0.disable_ipv6=0 >/dev/null
+    dc "$name" sysctl -w net.ipv6.conf.eth0.use_tempaddr=2 >/dev/null
+    dc "$name" ip -4 addr flush dev eth0
+    dc "$name" ip -4 addr add "192.168.$n.10/24" dev eth0
+  done
+  dc client1b sysctl -w net.ipv6.conf.eth0.disable_ipv6=0 >/dev/null
+  dc client1b sysctl -w net.ipv6.conf.eth0.use_tempaddr=2 >/dev/null
+  dc client1b ip -4 addr flush dev eth0
+  dc client1b ip -4 addr add 192.168.1.11/24 dev eth0
+}
+do_up() {
+  require_tools
+  local name
+  for name in isp router client{1..8} client1b; do check_name_free "$(container "$name")"; done
+  check_image_owned_or_free "$router_image"
+  check_image_owned_or_free "$peer_image"
+  build_images
+  create_networks
+  start_peers
+  configure_peers
+  start_router
+  note 'lab is up'
+}
+do_purge() {
+  require_tools
+  local resource
+  while IFS= read -r resource; do [[ -z $resource ]] || docker rm -f "$resource" >/dev/null; done < <(docker ps -aq --filter "label=$label")
+  while IFS= read -r resource; do [[ -z $resource ]] || docker network rm "$resource" >/dev/null; done < <(docker network ls -q --filter "label=$label")
+  while IFS= read -r resource; do [[ -z $resource ]] || docker image rm -f "$resource" >/dev/null; done < <(docker image ls -q --filter "label=$label" | sort -u)
+  if [[ -e "$generated/builder-owned" ]]; then
+    docker buildx prune --builder "$builder" --all --force >/dev/null 2>&1 || true
+    docker buildx rm "$builder" >/dev/null 2>&1 || true
+  fi
+  [[ ! -e "$generated" ]] || rm -rf -- "$generated"
+  note 'lab resources removed'
+}
+client_addr() {
+  dc "$1" ip -o -6 addr show dev eth0 scope global | awk '$4 ~ /^fd42:6e64:7000:1:/ && /proto kernel_ra/ {split($4,a,"/"); print a[1]; exit}'
+}
+assert_contains() { [[ $1 == *"$2"* ]] || die "expected '$2' in: $1"; }
+do_test() {
+  require_tools
+  owned_container "$(container router)" || die 'lab is not up'
+  local n peer name addr addr1 addr1b peer_mac route neigh temp old deadline proxy_table
+  declare -A addresses=()
+  for n in {1..8}; do
+    [[ $(dc router uci -q get "dhcp.lan$n.dhcpv6") == disabled ]] || die "DHCPv6 is enabled on LAN$n"
+    name="client$n"
+    wait_for "$name SLAAC" "[[ -n \$(client_addr $name) ]]"
+    addr=$(client_addr "$name")
+    addresses[$name]=$addr
+    wait_for "$name ISP connectivity" "dc $name ping -6 -I $addr -c 1 -W 2 fd42:6e64:7000:2::2"
+    wait_for "$name route installation" "dc router ip -6 route get $addr | grep -q 'dev eth$n'"
+    dc isp ping -6 -c 1 -W 2 "$addr" >/dev/null || die "ISP cannot reach $name"
+    assert_contains "$(dc router ip -6 neigh show proxy dev eth0)" "$addr"
+    note "LAN$n IPv6 and upstream NDP passed"
+  done
+  proxy_table=$(dc router ip -6 neigh show proxy)
+  for n in {1..8}; do
+    addr=${addresses[client$n]}
+    for peer in {0..8}; do
+      if (( peer == n )); then
+        [[ $proxy_table != *"$addr dev eth$peer proxy"* ]] || die "client$n is proxied on its own LAN"
+      else
+        assert_contains "$proxy_table" "$addr dev eth$peer proxy"
+      fi
+    done
+    assert_contains "$proxy_table" "fd42:6e64:7000:1::1 dev eth$n proxy"
+  done
+  wait_for 'second LAN1 client SLAAC' '[[ -n $(client_addr client1b) ]]'
+  addr1=${addresses[client1]}
+  addr1b=$(client_addr client1b)
+  dc client1b ping -6 -c 2 -W 2 "$addr1" >/dev/null || die 'LAN1 peers cannot communicate'
+  dc router nft delete table inet ndp64labcheck >/dev/null 2>&1 || true
+  dc router nft add table inet ndp64labcheck
+  dc router nft add chain inet ndp64labcheck forward '{ type filter hook forward priority 10; policy accept; }'
+  dc router nft add rule inet ndp64labcheck forward ip6 saddr "$addr1" ip6 daddr "$addr1b" counter
+  dc router nft add rule inet ndp64labcheck forward ip6 saddr "$addr1b" ip6 daddr "$addr1" counter
+  for name in client1 client1b; do
+    if [[ $name == client1 ]]; then addr=$addr1b; peer_mac=02:42:ac:10:01:0b; else addr=$addr1; peer_mac=02:42:ac:10:01:0a; fi
+    route=$(dc "$name" ip -6 route get "$addr")
+    assert_contains "$route" 'dev eth0'
+    [[ $route != *'via '* ]] || die "$name routes its LAN1 peer through a gateway"
+    dc "$name" ping -6 -c 1 -W 2 "$addr" >/dev/null
+    neigh=$(dc "$name" ip -6 neigh show "$addr" dev eth0)
+    assert_contains "$neigh" "$peer_mac"
+  done
+  if dc router nft list chain inet ndp64labcheck forward | grep -Eq 'counter packets [1-9]'; then
+    die 'LAN1 peer traffic entered the router forwarding path'
+  fi
+  dc client2 ping -6 -c 2 -W 2 "$addr1" >/dev/null || die 'cross-LAN connectivity failed'
+  assert_contains "$(dc router ip -6 route get "$addr1")" 'dev eth1'
+  assert_contains "$(dc router ip -6 route get "${addresses[client2]}")" 'dev eth2'
+  dc client1 ping -6 -I "$addr1" -c 2 -W 2 fd42:6e64:7000:2::2 >/dev/null || die 'explicit source address failed'
+  dc isp ping -6 -c 2 -W 2 "$addr1" >/dev/null || die 'inbound ICMPv6 echo blocked'
+  dc router nft add rule inet ndp64labcheck forward iifname eth0 ip6 daddr "$addr1" tcp dport 12345 counter
+  if dc isp nc -6 -z -w 2 "$addr1" 12345 >/dev/null 2>&1; then die 'new inbound TCP unexpectedly connected'; fi
+  if dc router nft list chain inet ndp64labcheck forward | grep -Eq 'tcp dport 12345 counter packets [1-9]'; then
+    die 'new inbound TCP passed the WAN firewall'
+  fi
+  dc router nft delete table inet ndp64labcheck
+  temp=$(dc client1 ip -o -6 addr show dev eth0 temporary | awk '$4 ~ /^fd42:/ {split($4,a,"/"); print a[1]; exit}')
+  [[ -n $temp ]] || die 'client1 has no IPv6 temporary address'
+  dc client1 ping -6 -I "$temp" -c 2 -W 2 fd42:6e64:7000:2::2 >/dev/null || die 'temporary address cannot reach ISP'
+  wait_for 'temporary address route' "dc router ip -6 route get $temp | grep -q 'dev eth1'"
+  old=$temp
+  dc client1 ip link set dev eth0 down
+  dc client1 ip link set dev eth0 up
+  dc client1 sysctl -w net.ipv6.conf.eth0.use_tempaddr=2 >/dev/null
+  deadline=$((SECONDS + 30))
+  while :; do
+    temp=$(dc client1 ip -o -6 addr show dev eth0 temporary | awk -v old="$old" '$4 ~ /^fd42:/ && $0 !~ /tentative/ {split($4,a,"/"); if (a[1] != old) {print a[1]; exit}}')
+    [[ -n $temp ]] && break
+    (( SECONDS < deadline )) || die 'temporary address did not rotate'
+    sleep 1
+  done
+  wait_for 'rotated temporary address connectivity' "dc client1 ping -6 -I $temp -c 1 -W 2 fd42:6e64:7000:2::2"
+  wait_for 'rotated temporary address route' "dc router ip -6 route get $temp | grep -q 'dev eth1'"
+  note 'all acceptance checks passed'
+}
+
+up_applet() { require_no_args "$@"; do_up; }
+test_applet() { require_no_args "$@"; do_test; }
+purge_applet() { require_no_args "$@"; do_purge; }
+reset_applet() { require_no_args "$@"; do_purge; do_up; do_test; }
+
+(( $# > 0 )) || die 'usage: ./lab {up|test|purge|reset}'
+applet=$1; shift
+case "$applet" in
+  up) up_applet "$@" ;;
+  test) test_applet "$@" ;;
+  purge) purge_applet "$@" ;;
+  reset) reset_applet "$@" ;;
+  *) die "unknown applet: $applet" ;;
+esac

@@ -1,0 +1,20 @@
+FROM golang:1.23-alpine@sha256:383395b794dffa5b53012a212365d40c8e37109a626ca30d6151c8348d380b5f AS helper
+WORKDIR /src
+COPY ndp-helper.go .
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o /ndp-helper ndp-helper.go
+
+FROM scratch
+ARG LAB_ID
+LABEL org.ndp64lab.owner="$LAB_ID"
+ADD .generated/openwrt-24.10.4-x86-64-rootfs.tar.gz /
+RUN mkdir -p /var/lock /tmp && opkg update && opkg install ip-full \
+    && uci -q delete 'firewall.@zone[0].network' \
+    && for n in 1 2 3 4 5 6 7 8; do uci add_list "firewall.@zone[0].network=lan$n"; done \
+    && uci commit firewall
+COPY --from=helper /ndp-helper /usr/sbin/lab-ndp
+COPY router/network /etc/config/network
+COPY router/dhcp /etc/config/dhcp
+COPY router/lab-ndp.init /etc/init.d/lab-ndp
+COPY router/entrypoint /usr/sbin/lab-entrypoint
+RUN chmod +x /etc/init.d/lab-ndp /usr/sbin/lab-entrypoint && ln -s ../init.d/lab-ndp /etc/rc.d/S95lab-ndp
+CMD ["/usr/sbin/lab-entrypoint"]
