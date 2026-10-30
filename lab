@@ -8,8 +8,6 @@ label="org.ndp64lab.owner=$prefix"
 builder=ndp64labbuilder
 router_image=ndp64labrouter:24.10.4
 peer_image=ndp64labpeer:3.20
-rootfs=openwrt-24.10.4-x86-64-rootfs.tar.gz
-rootfs_url="https://downloads.openwrt.org/releases/24.10.4/targets/x86/64/$rootfs"
 
 die() { printf 'lab: %s\n' "$*" >&2; exit 1; }
 note() { printf 'lab: %s\n' "$*" >&2; }
@@ -20,8 +18,7 @@ dc() { docker exec "$(container "$1")" "${@:2}"; }
 router_mac_matches() { [[ $(dc router cat "/sys/class/net/eth$1/address" 2>/dev/null) == "$2" ]]; }
 require_tools() {
   [[ $(uname -sm) == 'Linux x86_64' ]] || die 'requires Linux x86_64'
-  local tool
-  for tool in docker curl sha256sum; do command -v "$tool" >/dev/null || die "missing $tool"; done
+  command -v docker >/dev/null || die 'missing docker'
   docker info >/dev/null || die 'Docker Engine is unavailable'
   docker buildx version >/dev/null || die 'Docker buildx is unavailable'
 }
@@ -50,16 +47,8 @@ wait_for() {
     sleep 1
   done
 }
-download_rootfs() {
-  mkdir -p "$generated"
-  if ! (cd "$generated" && sha256sum -c "$here/rootfs.sha256" >/dev/null 2>&1); then
-    note 'downloading pinned OpenWrt rootfs'
-    curl --fail --location --retry 3 --output "$generated/$rootfs" "$rootfs_url"
-    (cd "$generated" && sha256sum -c "$here/rootfs.sha256") || die 'rootfs checksum mismatch'
-  fi
-}
 build_images() {
-  download_rootfs
+  mkdir -p "$generated"
   if [[ ! -e "$generated/builder-owned" ]]; then
     docker buildx inspect "$builder" >/dev/null 2>&1 && die "builder $builder exists without ownership marker"
     touch "$generated/builder-owned"

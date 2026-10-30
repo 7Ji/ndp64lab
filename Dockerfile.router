@@ -3,10 +3,9 @@ WORKDIR /src
 COPY ndp-helper.go .
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o /ndp-helper ndp-helper.go
 
-FROM scratch
+FROM openwrt/rootfs:x86-64-24.10.4@sha256:1310ccbd24f30b3df6e210a48dbd0fb902445ee80e21ffc8b8e882b94987a411
 ARG LAB_ID
 LABEL org.ndp64lab.owner="$LAB_ID"
-ADD .generated/openwrt-24.10.4-x86-64-rootfs.tar.gz /
 RUN mkdir -p /var/lock /tmp && opkg update && opkg install ip-full \
     && uci -q delete 'firewall.@zone[0].network' \
     && for n in 1 2 3 4 5 6 7 8; do uci add_list "firewall.@zone[0].network=lan$n"; done \

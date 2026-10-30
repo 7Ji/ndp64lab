@@ -8,10 +8,10 @@ fixed IPv4 fixtures. No host interface addresses are read.
 
 ## Requirements
 
-Linux x86_64, Docker Engine with buildx, Bash, curl, and permission to create
-privileged containers and bridge networks. The first `up` downloads the pinned
-OpenWrt x86/64 rootfs, checks it against `rootfs.sha256`, and builds a static Go
-helper inside Docker. The OpenWrt image installs `ip-full` from its 24.10.4
+Linux x86_64, Docker Engine with buildx, Bash, and permission to create
+privileged containers and bridge networks. The router image builds on the
+digest-pinned OpenWrt x86/64 24.10.4 container image and builds a static Go
+helper in a separate stage. It installs `ip-full` from OpenWrt's 24.10.4
 package feed, so the first build needs Internet access.
 
 ## Lifecycle
