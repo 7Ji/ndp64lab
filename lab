@@ -113,14 +113,16 @@ configure_peers() {
   for n in {1..8}; do
     name="client$n"
     dc "$name" sysctl -w net.ipv6.conf.eth0.disable_ipv6=0 >/dev/null
-    dc "$name" sysctl -w net.ipv6.conf.eth0.use_tempaddr=2 >/dev/null
+    dc "$name" sysctl -w net.ipv6.conf.eth0.use_tempaddr=0 >/dev/null
     dc "$name" ip -4 addr flush dev eth0
     dc "$name" ip -4 addr add "192.168.$n.10/24" dev eth0
+    dc "$name" ip -4 route replace default via "192.168.$n.1" dev eth0
   done
   dc client1b sysctl -w net.ipv6.conf.eth0.disable_ipv6=0 >/dev/null
-  dc client1b sysctl -w net.ipv6.conf.eth0.use_tempaddr=2 >/dev/null
+  dc client1b sysctl -w net.ipv6.conf.eth0.use_tempaddr=0 >/dev/null
   dc client1b ip -4 addr flush dev eth0
   dc client1b ip -4 addr add 192.168.1.11/24 dev eth0
+  dc client1b ip -4 route replace default via 192.168.1.1 dev eth0
 }
 do_up() {
   require_tools
@@ -155,35 +157,50 @@ assert_contains() { [[ $1 == *"$2"* ]] || die "expected '$2' in: $1"; }
 do_test() {
   require_tools
   owned_container "$(container router)" || die 'lab is not up'
-  local n peer name addr addr1 addr1b peer_mac route neigh temp old deadline proxy_table
-  declare -A addresses=()
-  for n in {1..8}; do
+  local n peer name addr addr1 addr1b peer_mac route neigh proxy_table global_addrs
+  declare -A addresses=() ipv4=() lans=()
+  for name in client{1..8} client1b; do
+    n=${name#client}
+    if [[ $n == 1b ]]; then n=1; ipv4[$name]=192.168.1.11
+    else ipv4[$name]="192.168.$n.10"; fi
+    lans[$name]=$n
     [[ $(dc router uci -q get "dhcp.lan$n.dhcpv6") == disabled ]] || die "DHCPv6 is enabled on LAN$n"
-    name="client$n"
     wait_for "$name SLAAC" "[[ -n \$(client_addr $name) ]]"
+    global_addrs=$(dc "$name" ip -o -6 addr show dev eth0 scope global)
+    [[ $(printf '%s\n' "$global_addrs" | wc -l) -eq 1 && $global_addrs != *temporary* ]] || die "$name has unexpected global IPv6 addresses: $global_addrs"
     addr=$(client_addr "$name")
     addresses[$name]=$addr
-    wait_for "$name ISP connectivity" "dc $name ping -6 -I $addr -c 1 -W 2 fd42:6e64:7000:2::2"
+    assert_contains "$(dc "$name" ip -4 route get 198.18.0.1)" "via 192.168.$n.1"
+    dc "$name" ping -4 -c 1 -W 2 198.18.0.1 >/dev/null || die "$name cannot reach WAN over IPv4"
+    wait_for "$name IPv6 WAN connectivity" "dc $name ping -6 -I $addr -c 1 -W 2 fd42:6e64:7000:2::2"
     wait_for "$name route installation" "dc router ip -6 route get $addr | grep -q 'dev eth$n'"
     dc isp ping -6 -c 1 -W 2 "$addr" >/dev/null || die "ISP cannot reach $name"
     assert_contains "$(dc router ip -6 neigh show proxy dev eth0)" "$addr"
-    note "LAN$n IPv6 and upstream NDP passed"
+    note "$name IPv4/IPv6 WAN and upstream NDP passed"
   done
   proxy_table=$(dc router ip -6 neigh show proxy)
-  for n in {1..8}; do
-    addr=${addresses[client$n]}
+  for name in client{1..8} client1b; do
+    n=${lans[$name]}
+    addr=${addresses[$name]}
     for peer in {0..8}; do
       if (( peer == n )); then
-        [[ $proxy_table != *"$addr dev eth$peer proxy"* ]] || die "client$n is proxied on its own LAN"
+        [[ $proxy_table != *"$addr dev eth$peer proxy"* ]] || die "$name is proxied on its own LAN"
       else
         assert_contains "$proxy_table" "$addr dev eth$peer proxy"
       fi
     done
     assert_contains "$proxy_table" "fd42:6e64:7000:1::1 dev eth$n proxy"
   done
-  wait_for 'second LAN1 client SLAAC' '[[ -n $(client_addr client1b) ]]'
+  for name in client{1..8} client1b; do
+    for peer in client{1..8} client1b; do
+      [[ ${lans[$name]} == "${lans[$peer]}" ]] && continue
+      dc "$name" ping -4 -c 1 -W 2 "${ipv4[$peer]}" >/dev/null || die "$name cannot reach $peer over IPv4"
+      dc "$name" ping -6 -c 1 -W 2 "${addresses[$peer]}" >/dev/null || die "$name cannot reach $peer over IPv6"
+    done
+  done
+  note 'all cross-LAN IPv4 and IPv6 pairs passed'
   addr1=${addresses[client1]}
-  addr1b=$(client_addr client1b)
+  addr1b=${addresses[client1b]}
   dc client1b ping -6 -c 2 -W 2 "$addr1" >/dev/null || die 'LAN1 peers cannot communicate'
   dc router nft delete table inet ndp64labcheck >/dev/null 2>&1 || true
   dc router nft add table inet ndp64labcheck
@@ -202,34 +219,15 @@ do_test() {
   if dc router nft list chain inet ndp64labcheck forward | grep -Eq 'counter packets [1-9]'; then
     die 'LAN1 peer traffic entered the router forwarding path'
   fi
-  dc client2 ping -6 -c 2 -W 2 "$addr1" >/dev/null || die 'cross-LAN connectivity failed'
   assert_contains "$(dc router ip -6 route get "$addr1")" 'dev eth1'
   assert_contains "$(dc router ip -6 route get "${addresses[client2]}")" 'dev eth2'
   dc client1 ping -6 -I "$addr1" -c 2 -W 2 fd42:6e64:7000:2::2 >/dev/null || die 'explicit source address failed'
-  dc isp ping -6 -c 2 -W 2 "$addr1" >/dev/null || die 'inbound ICMPv6 echo blocked'
   dc router nft add rule inet ndp64labcheck forward iifname eth0 ip6 daddr "$addr1" tcp dport 12345 counter
   if dc isp nc -6 -z -w 2 "$addr1" 12345 >/dev/null 2>&1; then die 'new inbound TCP unexpectedly connected'; fi
   if dc router nft list chain inet ndp64labcheck forward | grep -Eq 'tcp dport 12345 counter packets [1-9]'; then
     die 'new inbound TCP passed the WAN firewall'
   fi
   dc router nft delete table inet ndp64labcheck
-  temp=$(dc client1 ip -o -6 addr show dev eth0 temporary | awk '$4 ~ /^fd42:/ {split($4,a,"/"); print a[1]; exit}')
-  [[ -n $temp ]] || die 'client1 has no IPv6 temporary address'
-  dc client1 ping -6 -I "$temp" -c 2 -W 2 fd42:6e64:7000:2::2 >/dev/null || die 'temporary address cannot reach ISP'
-  wait_for 'temporary address route' "dc router ip -6 route get $temp | grep -q 'dev eth1'"
-  old=$temp
-  dc client1 ip link set dev eth0 down
-  dc client1 ip link set dev eth0 up
-  dc client1 sysctl -w net.ipv6.conf.eth0.use_tempaddr=2 >/dev/null
-  deadline=$((SECONDS + 30))
-  while :; do
-    temp=$(dc client1 ip -o -6 addr show dev eth0 temporary | awk -v old="$old" '$4 ~ /^fd42:/ && $0 !~ /tentative/ {split($4,a,"/"); if (a[1] != old) {print a[1]; exit}}')
-    [[ -n $temp ]] && break
-    (( SECONDS < deadline )) || die 'temporary address did not rotate'
-    sleep 1
-  done
-  wait_for 'rotated temporary address connectivity' "dc client1 ping -6 -I $temp -c 1 -W 2 fd42:6e64:7000:2::2"
-  wait_for 'rotated temporary address route' "dc router ip -6 route get $temp | grep -q 'dev eth1'"
   note 'all acceptance checks passed'
 }
 

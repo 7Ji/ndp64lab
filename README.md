@@ -39,9 +39,11 @@ plus `fd42:6e64:7000:2::2/128` on loopback. OpenWrt has `198.18.0.2/30` and
 `fd42:6e64:7000:1::2/128` on `eth0`, with its IPv6 default route via
 `fe80::1`. `eth1` through `eth8` have `192.168.1.1/24` through
 `192.168.8.1/24`. Clients use `.10` on their LAN; the second LAN1 client uses
-`192.168.1.11/24`. All clients receive the on-link, autonomous
+`192.168.1.11/24`. Each client uses its LAN router address as the IPv4 default
+gateway. All clients receive one on-link, autonomous
 `fd42:6e64:7000:1::/64` prefix via Router Advertisements from the helper.
-DHCPv6 is disabled on each LAN.
+DHCPv6 is disabled on each LAN, and clients do not generate temporary IPv6
+addresses.
 
 OpenWrt's firewall keeps the normal LAN-to-WAN forwarding, WAN rejection, and
 ICMPv6 forwarding behavior. The in-router helper sends RAs, learns client
@@ -51,11 +53,11 @@ address on every LAN so replies can reach the ISP. The helper does not proxy a
 client address on that client's own LAN, leaving same-LAN traffic on the Docker
 bridge rather than in OpenWrt's forwarding path.
 
-`test` checks that DHCPv6 is disabled on each LAN, plus all LANs, cross-LAN
-traffic, the loopback ISP endpoint, upstream NDP, explicit source selection,
-temporary-address changes, inbound ICMPv6, blocked new inbound TCP, and direct
-LAN1 peer routing and MAC resolution. A temporary nftables counter checks that
-LAN1 peer traffic does not enter OpenWrt's forwarding path.
+`test` checks that each client has one global SLAAC address, IPv4 and IPv6
+traffic between every pair of LANs, outbound IPv4 to the ISP, IPv6 in both
+directions with the ISP, upstream NDP, blocked new inbound TCP, and direct LAN1
+peer routing and MAC resolution. A temporary nftables counter checks that LAN1
+peer traffic does not enter OpenWrt's forwarding path.
 
 When diagnosing a failed run, `docker exec ndp64labrouter logread` shows
 OpenWrt and helper logs. `./lab purge` also works after a partial `up`.
