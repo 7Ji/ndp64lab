@@ -22,6 +22,61 @@ require_tools() {
   docker info >/dev/null || die 'Docker Engine is unavailable'
   docker buildx version >/dev/null || die 'Docker buildx is unavailable'
 }
+# Only this table in the Topology section supplies address naming seeds.
+load_addresses() {
+  local key seed stem4 stem6
+  local -A seeds=()
+  while IFS=' ' read -r key seed; do
+    [[ $key == customer || $key == public ]] || die "unknown address key: $key"
+    [[ ! -v seeds[$key] ]] || die "duplicate address key: $key"
+    [[ $seed =~ ^[abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ]{3}$ ]] || die "address seed $key must contain three ASCII letters"
+    seeds[$key]=$seed
+  done < <(LC_ALL=C awk '
+    /^## Topology$/ {topology=1; next}
+    topology && /^## / {exit}
+    topology && /^\| `address-seed:/ {
+      gsub(/`/, "", $2); gsub(/address-seed:/, "", $2)
+      gsub(/`/, "", $3); print $2, $3
+    }' FS='|' "$here/README.md")
+  for key in customer public; do
+    [[ -v seeds[$key] ]] || die "missing address-seed:$key in README Topology table"
+    seed=${seeds[$key]}
+    LC_ALL=C printf -v stem4 '%d.%d.%d' "'${seed:0:1}" "'${seed:1:1}" "'${seed:2:1}"
+    LC_ALL=C printf -v stem6 '2%03d:%d:%d' "'${seed:0:1}" "'${seed:1:1}" "'${seed:2:1}"
+    if [[ $key == customer ]]; then customer4=$stem4; customer6=$stem6
+    else public4=$stem4; public6=$stem6; fi
+  done
+  [[ $customer4 != "$public4" ]] || die 'customer and public seeds must differ'
+  isp_identity4=$customer4.1
+  isp_customer4=$customer4.100
+  router4=$customer4.101
+  isp_dmz4=$customer4.200
+  dmz4=$customer4.201
+  isp_public4=$public4.1
+  website4=$public4.2
+  shared6=$customer6:100::
+  isp_customer6=${shared6}1
+  router6=${shared6}2
+  isp_dmz6=$customer6:200::1
+  dmz6=$customer6:200::2
+  isp_public6=$public6::1
+  website6=$public6::2
+}
+address_manifest() {
+  printf 'shared6=%s\nisp_customer6=%s\nwebsite4=%s\nwebsite6=%s\n' \
+    "$shared6" "$isp_customer6" "$website4" "$website6"
+}
+prepare_configuration() {
+  mkdir -p "$generated/www"
+  # No new payload until a new deployment; test/up on an existing lab never rewrites it.
+  # A finite random input avoids SIGPIPE under pipefail. Base64 is printable ASCII.
+  head -c 3072 /dev/urandom | base64 | tr -d '\n' > "$generated/www/index.html"
+  [[ $(wc -c < "$generated/www/index.html") == 4096 ]] || die 'payload generation failed'
+  printf '.html:text/plain\n' > "$generated/www/httpd.conf"
+  address_manifest > "$generated/addresses"
+  sed -e "s/@ROUTER4@/$router4/g" -e "s/@GATEWAY4@/$isp_customer4/g" \
+      -e "s/@ROUTER6@/$router6/g" "$here/router/network" > "$generated/network"
+}
 owned_container() {
   [[ $(docker inspect -f '{{index .Config.Labels "org.ndp64lab.owner"}}' "$1" 2>/dev/null) == "$prefix" ]]
 }
@@ -59,7 +114,7 @@ build_images() {
 }
 create_networks() {
   local segment
-  for segment in wan {1..8}; do
+  for segment in wan public dmz {1..8}; do
     local name; name=$(network "$segment")
     docker network inspect "$name" >/dev/null 2>&1 && die "network $name already exists"
     docker network create --internal --driver bridge --label "$label" "$name" >/dev/null
@@ -68,6 +123,13 @@ create_networks() {
 start_peers() {
   docker run -d --privileged --name "$(container isp)" --label "$label" \
     --network "$(network wan)" --mac-address 02:42:ac:20:00:01 "$peer_image" >/dev/null
+  docker network connect "$(network public)" "$(container isp)"
+  docker network connect "$(network dmz)" "$(container isp)"
+  docker run -d --privileged --name "$(container dmz)" --label "$label" \
+    --network "$(network dmz)" "$peer_image" >/dev/null
+  docker run -d --privileged --name "$(container website)" --label "$label" \
+    --volume "$generated/www:/www:ro" --network "$(network public)" "$peer_image" \
+    httpd -f -p 80 -h /www >/dev/null
   local n name mac
   for n in {1..8}; do
     printf -v mac '02:42:ac:10:%02x:0a' "$n"
@@ -104,12 +166,35 @@ start_router() {
 }
 configure_peers() {
   local n name
-  dc isp sysctl -w net.ipv6.conf.eth0.disable_ipv6=0 >/dev/null
-  dc isp ip -4 addr flush dev eth0
-  dc isp ip -4 addr add 198.18.0.1/30 dev eth0
+  local port
+  for port in eth0 eth1 eth2; do
+    dc isp ip -4 addr flush dev "$port"
+    dc isp sysctl -w "net.ipv6.conf.$port.disable_ipv6=0" >/dev/null
+  done
+  dc isp sysctl -w net.ipv4.ip_forward=1 net.ipv6.conf.all.forwarding=1 >/dev/null
+  dc isp ip -4 addr add "$isp_identity4/32" dev lo
+  dc isp ip -4 addr add "$isp_customer4/31" dev eth0
   dc isp ip -6 addr add fe80::1/64 dev eth0
-  dc isp ip -6 addr add fd42:6e64:7000:1::1/64 dev eth0
-  dc isp ip -6 addr add fd42:6e64:7000:2::2/128 dev lo
+  dc isp ip -6 addr add "$isp_customer6/64" dev eth0
+  dc isp ip -4 addr add "$isp_public4/30" dev eth1
+  dc isp ip -6 addr add "$isp_public6/64" dev eth1
+  dc isp ip -4 addr add "$isp_dmz4/31" dev eth2
+  dc isp ip -6 addr add "$isp_dmz6/64" dev eth2
+  for name in dmz website; do
+    dc "$name" ip -4 addr flush dev eth0
+    dc "$name" sysctl -w net.ipv6.conf.eth0.disable_ipv6=0 >/dev/null
+    if [[ $name == dmz ]]; then
+      dc "$name" ip -4 addr add "$dmz4/31" dev eth0
+      dc "$name" ip -6 addr add "$dmz6/64" dev eth0
+      dc "$name" ip -4 route replace default via "$isp_dmz4"
+      dc "$name" ip -6 route replace default via "$isp_dmz6"
+    else
+      dc "$name" ip -4 addr add "$website4/30" dev eth0
+      dc "$name" ip -6 addr add "$website6/64" dev eth0
+      dc "$name" ip -4 route replace default via "$isp_public4"
+      dc "$name" ip -6 route replace default via "$isp_public6"
+    fi
+  done
   for n in {1..8}; do
     name="client$n"
     dc "$name" sysctl -w net.ipv6.conf.eth0.disable_ipv6=0 >/dev/null
@@ -125,11 +210,13 @@ configure_peers() {
   dc client1b ip -4 route replace default via 192.168.1.1 dev eth0
 }
 do_up() {
+  load_addresses
   require_tools
   local name
-  for name in isp router client{1..8} client1b; do check_name_free "$(container "$name")"; done
+  for name in isp router website dmz client{1..8} client1b; do check_name_free "$(container "$name")"; done
   check_image_owned_or_free "$router_image"
   check_image_owned_or_free "$peer_image"
+  prepare_configuration
   build_images
   create_networks
   start_peers
@@ -151,23 +238,43 @@ do_purge() {
   note 'lab resources removed'
 }
 client_addr() {
-  dc "$1" ip -o -6 addr show dev eth0 scope global | awk '$4 ~ /^fd42:6e64:7000:1:/ && /proto kernel_ra/ {split($4,a,"/"); print a[1]; exit}'
+  dc "$1" ip -o -6 addr show dev eth0 scope global | awk -v prefix="$shared6" 'index($4, substr(prefix, 1, length(prefix)-1)) == 1 && /proto kernel_ra/ {split($4,a,"/"); print a[1]; exit}'
 }
 assert_contains() { [[ $1 == *"$2"* ]] || die "expected '$2' in: $1"; }
+check_website() {
+  local name=$1 target response
+  [[ $(wc -c < "$generated/www/index.html") == 4096 ]] || die 'invalid deployment payload size'
+  LC_ALL=C tr -d ' -~' < "$generated/www/index.html" | cmp -s - /dev/null || die 'non-printable deployment payload'
+  response=$(mktemp "$generated/http.XXXXXX")
+  for target in "$website4" "[$website6]"; do
+    # Curl fails on HTTP errors; cmp compares every byte, including trailing newlines.
+    if ! dc "$name" curl --noproxy '*' --fail --silent --show-error --max-time 5 "http://$target/" > "$response"; then
+      rm -f "$response"
+      die "$name HTTP request to $target failed"
+    fi
+    if ! cmp -s "$response" "$generated/www/index.html"; then
+      rm -f "$response"
+      die "$name HTTP body from $target differs from deployment payload"
+    fi
+  done
+  rm -f "$response"
+}
 do_test() {
+  load_addresses
   require_tools
   owned_container "$(container router)" || die 'lab is not up'
+  [[ $(cat "$generated/addresses") == "$(address_manifest)" ]] || die 'README address seeds changed; run ./lab reset'
   local n peer name addr addr1 addr1b peer_mac route neigh proxy_table global_addrs unknown_route
-  assert_contains "$(dc router ip -6 route get fd42:6e64:7000:1::1)" 'via fe80::1 dev eth0'
-  wait_for 'router ISP on-link connectivity' 'dc router ping -6 -c 1 -W 2 fd42:6e64:7000:1::1'
-  if unknown_route=$(dc router ip -6 route get fd42:6e64:7000:1:42::1 2>&1); then
+  assert_contains "$(dc router ip -6 route get "$isp_customer6")" 'via fe80::1 dev eth0'
+  wait_for 'router ISP on-link connectivity' "dc router ping -6 -c 1 -W 2 $isp_customer6"
+  if unknown_route=$(dc router ip -6 route get "${shared6}dead:beef" 2>&1); then
     die "unknown shared-prefix address routes via WAN: $unknown_route"
   fi
   assert_contains "$unknown_route" 'unreachable'
-  if dc router ping -6 -c 1 -W 1 fd42:6e64:7000:1:42::1 >/dev/null 2>&1; then
+  if dc router ping -6 -c 1 -W 1 "${shared6}dead:beef" >/dev/null 2>&1; then
     die 'router reached an unknown shared-prefix address'
   fi
-  [[ -z $(dc router ip -6 neigh show fd42:6e64:7000:1:42::1 dev eth0) ]] || die 'unknown address triggered WAN neighbor discovery'
+  [[ -z $(dc router ip -6 neigh show "${shared6}dead:beef" dev eth0) ]] || die 'unknown address triggered WAN neighbor discovery'
   declare -A addresses=() ipv4=() lans=()
   for name in client{1..8} client1b; do
     n=${name#client}
@@ -180,14 +287,16 @@ do_test() {
     [[ $(printf '%s\n' "$global_addrs" | wc -l) -eq 1 && $global_addrs != *temporary* ]] || die "$name has unexpected global IPv6 addresses: $global_addrs"
     addr=$(client_addr "$name")
     addresses[$name]=$addr
-    assert_contains "$(dc "$name" ip -4 route get 198.18.0.1)" "via 192.168.$n.1"
-    dc "$name" ping -4 -c 1 -W 2 198.18.0.1 >/dev/null || die "$name cannot reach WAN over IPv4"
-    wait_for "$name IPv6 WAN connectivity" "dc $name ping -6 -I $addr -c 1 -W 2 fd42:6e64:7000:2::2"
-    wait_for "$name ISP on-link connectivity" "dc $name ping -6 -I $addr -c 1 -W 2 fd42:6e64:7000:1::1"
+    assert_contains "$(dc "$name" ip -4 route get "$isp_identity4")" "via 192.168.$n.1"
+    dc "$name" ping -4 -c 1 -W 2 "$isp_identity4" >/dev/null || die "$name cannot reach WAN over IPv4"
+    wait_for "$name IPv6 WAN connectivity" "dc $name ping -6 -I $addr -c 1 -W 2 ${dmz6}"
+    wait_for "$name ISP on-link connectivity" "dc $name ping -6 -I $addr -c 1 -W 2 ${isp_customer6}"
     wait_for "$name route installation" "dc router ip -6 route get $addr | grep -q 'dev eth$n'"
     dc isp ping -6 -c 1 -W 2 "$addr" >/dev/null || die "ISP cannot reach $name"
     assert_contains "$(dc router ip -6 neigh show proxy dev eth0)" "$addr"
-    note "$name IPv4/IPv6 WAN and upstream NDP passed"
+    dc dmz ping -6 -c 1 -W 2 "$addr" >/dev/null || die "DMZ cannot reach $name"
+    check_website "$name"
+    note "$name IPv4/IPv6 WAN, DMZ, HTTP content and upstream NDP passed"
   done
   proxy_table=$(dc router ip -6 neigh show proxy)
   for name in client{1..8} client1b; do
@@ -200,7 +309,7 @@ do_test() {
         assert_contains "$proxy_table" "$addr dev eth$peer proxy"
       fi
     done
-    assert_contains "$proxy_table" "fd42:6e64:7000:1::1 dev eth$n proxy"
+    assert_contains "$proxy_table" "${isp_customer6} dev eth$n proxy"
   done
   for name in client{1..8} client1b; do
     for peer in client{1..8} client1b; do
@@ -232,13 +341,23 @@ do_test() {
   fi
   assert_contains "$(dc router ip -6 route get "$addr1")" 'dev eth1'
   assert_contains "$(dc router ip -6 route get "${addresses[client2]}")" 'dev eth2'
-  dc client1 ping -6 -I "$addr1" -c 2 -W 2 fd42:6e64:7000:2::2 >/dev/null || die 'explicit source address failed'
+  dc client1 ping -6 -I "$addr1" -c 2 -W 2 "$dmz6" >/dev/null || die 'explicit source address failed'
   dc router nft add rule inet ndp64labcheck forward iifname eth0 ip6 daddr "$addr1" tcp dport 12345 counter
-  if dc isp nc -6 -z -w 2 "$addr1" 12345 >/dev/null 2>&1; then die 'new inbound TCP unexpectedly connected'; fi
+  # Prove a service is listening before checking the firewall; a closed port
+  # or unsupported nc option must not make this test pass.
+  dc client1 sh -c 'mkdir -p /tmp/inbound; printf inbound > /tmp/inbound/index.html; httpd -p 12345 -h /tmp/inbound'
+  [[ $(dc client1 curl --noproxy '*' --fail --silent --max-time 2 'http://[::1]:12345/') == inbound ]] || die 'inbound test listener is unavailable'
+  for name in isp dmz; do
+    if dc "$name" curl --noproxy '*' --fail --silent --max-time 2 "http://[$addr1]:12345/" >/dev/null 2>&1; then
+      die "new inbound TCP from $name unexpectedly connected"
+    fi
+  done
+  dc client1 sh -c 'kill $(pidof httpd)'
   if dc router nft list chain inet ndp64labcheck forward | grep -Eq 'tcp dport 12345 counter packets [1-9]'; then
     die 'new inbound TCP passed the WAN firewall'
   fi
   dc router nft delete table inet ndp64labcheck
+  check_website dmz
   note 'all acceptance checks passed'
 }
 
@@ -246,6 +365,9 @@ up_applet() { require_no_args "$@"; do_up; }
 test_applet() { require_no_args "$@"; do_test; }
 purge_applet() { require_no_args "$@"; do_purge; }
 reset_applet() { require_no_args "$@"; do_purge; do_up; do_test; }
+
+# Allow the address generator to be exercised without Docker.
+if [[ ${BASH_SOURCE[0]} != "$0" ]]; then return 0; fi
 
 (( $# > 0 )) || die 'usage: ./lab {up|test|purge|reset}'
 applet=$1; shift

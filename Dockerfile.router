@@ -11,7 +11,6 @@ RUN mkdir -p /var/lock /tmp && opkg update && opkg install ip-full \
     && for n in 1 2 3 4 5 6 7 8; do uci add_list "firewall.@zone[0].network=lan$n"; done \
     && uci commit firewall
 COPY --from=helper /ndp-helper /usr/sbin/lab-ndp
-COPY router/network /etc/config/network
 COPY router/dhcp /etc/config/dhcp
 COPY router/lab-ndp.init /etc/init.d/lab-ndp
 COPY router/entrypoint /usr/sbin/lab-entrypoint

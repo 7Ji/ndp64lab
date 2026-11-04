@@ -12,7 +12,8 @@ import (
 	"time"
 )
 
-var prefix = net.ParseIP("fd42:6e64:7000:1::").To16()
+var prefix net.IP
+var subnet *net.IPNet
 
 type sighting struct {
 	addr string
@@ -54,7 +55,7 @@ func watch(lan int, found chan<- sighting) {
 			continue
 		}
 		ip := net.IP(buf[22:38])
-		if !strings.HasPrefix(ip.String(), "fd42:6e64:7000:1:") || ip.Equal(prefix) {
+		if !subnet.Contains(ip) || ip.Equal(prefix) {
 			continue
 		}
 		found <- sighting{ip.String(), lan}
@@ -98,10 +99,25 @@ func advertise(lan int) {
 }
 
 func main() {
+	if len(os.Args) != 3 {
+		log.Fatal("usage: lab-ndp PREFIX/64 ISP_ADDRESS")
+	}
+	var err error
+	prefix, subnet, err = net.ParseCIDR(os.Args[1])
+	if err != nil {
+		log.Fatal(err)
+	}
+	ones, bits := subnet.Mask.Size()
+	upstream := net.ParseIP(os.Args[2])
+	if ones != 64 || bits != 128 || !prefix.Equal(subnet.IP) || upstream == nil || !subnet.Contains(upstream) || upstream.Equal(prefix) {
+		log.Fatal("expected an IPv6 /64 network and an ISP address within it")
+	}
+	prefix = prefix.To16()
+
 	if err := os.WriteFile("/proc/sys/net/ipv6/conf/all/forwarding", []byte("1"), 0644); err != nil {
 		log.Fatal(err)
 	}
-	if err := command("-6", "route", "replace", "fd42:6e64:7000:1::1/128", "via", "fe80::1", "dev", "eth0"); err != nil {
+	if err := command("-6", "route", "replace", upstream.String()+"/128", "via", "fe80::1", "dev", "eth0"); err != nil {
 		log.Fatal(err)
 	}
 	if err := command("-6", "route", "replace", "unreachable", prefix.String()+"/64"); err != nil {
@@ -114,7 +130,7 @@ func main() {
 	}
 	found := make(chan sighting, 256)
 	for i := 1; i <= 8; i++ {
-		if err := command("-6", "neigh", "replace", "proxy", "fd42:6e64:7000:1::1", "dev", fmt.Sprintf("eth%d", i)); err != nil {
+		if err := command("-6", "neigh", "replace", "proxy", upstream.String(), "dev", fmt.Sprintf("eth%d", i)); err != nil {
 			log.Fatal(err)
 		}
 		go watch(i, found)
