@@ -157,7 +157,17 @@ assert_contains() { [[ $1 == *"$2"* ]] || die "expected '$2' in: $1"; }
 do_test() {
   require_tools
   owned_container "$(container router)" || die 'lab is not up'
-  local n peer name addr addr1 addr1b peer_mac route neigh proxy_table global_addrs
+  local n peer name addr addr1 addr1b peer_mac route neigh proxy_table global_addrs unknown_route
+  assert_contains "$(dc router ip -6 route get fd42:6e64:7000:1::1)" 'via fe80::1 dev eth0'
+  wait_for 'router ISP on-link connectivity' 'dc router ping -6 -c 1 -W 2 fd42:6e64:7000:1::1'
+  if unknown_route=$(dc router ip -6 route get fd42:6e64:7000:1:42::1 2>&1); then
+    die "unknown shared-prefix address routes via WAN: $unknown_route"
+  fi
+  assert_contains "$unknown_route" 'unreachable'
+  if dc router ping -6 -c 1 -W 1 fd42:6e64:7000:1:42::1 >/dev/null 2>&1; then
+    die 'router reached an unknown shared-prefix address'
+  fi
+  [[ -z $(dc router ip -6 neigh show fd42:6e64:7000:1:42::1 dev eth0) ]] || die 'unknown address triggered WAN neighbor discovery'
   declare -A addresses=() ipv4=() lans=()
   for name in client{1..8} client1b; do
     n=${name#client}
@@ -173,6 +183,7 @@ do_test() {
     assert_contains "$(dc "$name" ip -4 route get 198.18.0.1)" "via 192.168.$n.1"
     dc "$name" ping -4 -c 1 -W 2 198.18.0.1 >/dev/null || die "$name cannot reach WAN over IPv4"
     wait_for "$name IPv6 WAN connectivity" "dc $name ping -6 -I $addr -c 1 -W 2 fd42:6e64:7000:2::2"
+    wait_for "$name ISP on-link connectivity" "dc $name ping -6 -I $addr -c 1 -W 2 fd42:6e64:7000:1::1"
     wait_for "$name route installation" "dc router ip -6 route get $addr | grep -q 'dev eth$n'"
     dc isp ping -6 -c 1 -W 2 "$addr" >/dev/null || die "ISP cannot reach $name"
     assert_contains "$(dc router ip -6 neigh show proxy dev eth0)" "$addr"

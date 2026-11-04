@@ -101,6 +101,12 @@ func main() {
 	if err := os.WriteFile("/proc/sys/net/ipv6/conf/all/forwarding", []byte("1"), 0644); err != nil {
 		log.Fatal(err)
 	}
+	if err := command("-6", "route", "replace", "fd42:6e64:7000:1::1/128", "via", "fe80::1", "dev", "eth0"); err != nil {
+		log.Fatal(err)
+	}
+	if err := command("-6", "route", "replace", "unreachable", prefix.String()+"/64"); err != nil {
+		log.Fatal(err)
+	}
 	for i := 0; i <= 8; i++ {
 		if err := os.WriteFile(fmt.Sprintf("/proc/sys/net/ipv6/conf/eth%d/proxy_ndp", i), []byte("1"), 0644); err != nil {
 			log.Fatal(err)

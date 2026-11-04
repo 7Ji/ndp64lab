@@ -32,7 +32,64 @@ networks, and images by the `org.ndp64lab.owner=ndp64lab` label. The dedicated
 `ndp64labbuilder` buildx instance is removed only when its ownership marker is
 present under `.generated`. The generated directory is ignored by Git.
 
-## Fixed Addressing
+## Topology
+
+The following topology is planned and not yet implemented. The lab described
+above and under **Current Fixed Addressing** below still uses the existing
+eleven-container topology and addresses.
+
+```mermaid
+flowchart LR
+    website["Public website"] <--> isp["ISP"]
+    isp <--> router["OpenWrt"]
+    isp <--> dmz["DMZ client"]
+    router <--> lan1["LAN1"]
+    router <--> lan2["LAN2"]
+    router <--> lan3["LAN3"]
+    router <--> lan4["LAN4"]
+    router <--> lan5["LAN5"]
+    router <--> lan6["LAN6"]
+    router <--> lan7["LAN7"]
+    router <--> lan8["LAN8"]
+```
+
+| Link | Endpoint | IPv4 | IPv6 |
+| --- | --- | --- | --- |
+| Public | ISP | `76.65.66.1/30` | `2076:65:66::1/64` |
+| Public | Website | `76.65.66.2/30` | `2076:65:66::2/64` |
+| Customer | ISP | `108.97.98.100/31` | `2108:97:98:100::1/64` |
+| Customer | OpenWrt | `108.97.98.101/31` | `2108:97:98:100::2/128` |
+| DMZ | ISP | `108.97.98.200/31` | `2108:97:98:200::1/64` |
+| DMZ | DMZ client | `108.97.98.201/31` | `2108:97:98:200::2/64` |
+
+The website uses the ISP's `76.65.66.1` and `2076:65:66::1` as its return
+gateways. OpenWrt uses `108.97.98.100` as its direct IPv4 gateway, and the DMZ
+client uses `108.97.98.200`. The ISP keeps `108.97.98.1/32` as a separate
+identity address; it is not a direct link gateway. No IPv4 proxy ARP is needed.
+
+The eight LANs share `2108:97:98:100::/64` with the customer link, using the
+current model of client `/128` routes and NDP proxying across WAN and LANs.
+The customer and DMZ address pools, `108.97.98.0/24` and
+`2108:97:98::/48`, are routed aggregates, not connected link masks; the links
+use the masks shown in the table.
+
+The decimal ASCII codes `108`, `97`, and `98` spell lowercase **lab**;
+`76`, `65`, and `66` spell uppercase **LAB**. The IPv6 forms prepend `2` to
+the zero-padded, three-digit first code: `108` becomes `2108`, and `076`
+becomes `2076`.
+
+### Expected Traffic
+
+For the planned topology:
+
+- Clients on different LANs can communicate over IPv4 and IPv6.
+- Lab clients and the DMZ client can access the public website over both
+  IPv4 and IPv6. Each HTTP request returns fresh random printable ASCII.
+- Lab clients and the DMZ client can ping each other over IPv6.
+- New inbound TCP connections to lab clients remain blocked by OpenWrt's
+  firewall. Inbound IPv4 access to lab clients is not promised.
+
+## Current Fixed Addressing
 
 The ISP has `198.18.0.1/30`, `fd42:6e64:7000:1::1/64`, and `fe80::1` on WAN,
 plus `fd42:6e64:7000:2::2/128` on loopback. OpenWrt has `198.18.0.2/30` and
@@ -51,12 +108,15 @@ addresses from LAN packets, installs `/128` routes, and proxies NDP for each
 client on WAN and the other seven LANs. It also proxies the ISP's on-link `::1`
 address on every LAN so replies can reach the ISP. The helper does not proxy a
 client address on that client's own LAN, leaving same-LAN traffic on the Docker
-bridge rather than in OpenWrt's forwarding path.
+bridge rather than in OpenWrt's forwarding path. A `/128` route sends the ISP's
+`::1` address to WAN; an unreachable route for the shared `/64` rejects unknown
+destinations instead of sending them to the ISP.
 
 `test` checks that each client has one global SLAAC address, IPv4 and IPv6
 traffic between every pair of LANs, outbound IPv4 to the ISP, IPv6 in both
 directions with the ISP, upstream NDP, blocked new inbound TCP, and direct LAN1
-peer routing and MAC resolution. A temporary nftables counter checks that LAN1
+peer routing and MAC resolution. It also checks that unknown addresses in the
+shared prefix are unreachable. A temporary nftables counter checks that LAN1
 peer traffic does not enter OpenWrt's forwarding path.
 
 When diagnosing a failed run, `docker exec ndp64labrouter logread` shows
