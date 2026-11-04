@@ -45,33 +45,19 @@ Each value must be three ASCII letters, and the two values must differ.
 | `address-seed:customer` | `lab` | ISP identity, customer link, shared LAN IPv6 prefix, and DMZ |
 | `address-seed:public` | `LAB` | Public website link |
 
-The diagram shows the generated addresses for these names, including the ISP
-gateway on each link and the separate ISP identity address. The shaded area
-highlights the unusual part: one IPv6 `/64` spans the customer link and eight
-separate LANs, while each LAN has its own IPv4 subnet. Configuration and tests
-calculate addresses from the naming table; the diagram is an example.
+The ISP has three separate links. With the names above, their addresses are:
 
-```mermaid
-flowchart TB
-    website["Public website<br/>76.65.66.2/30<br/>2076:65:66::2/64<br/>HTTP: one fixed random payload per deployment"]
-    isp["ISP router<br/>Separate identity: 108.97.98.1/32"]
-    dmz["DMZ client<br/>108.97.98.201/31<br/>2108:97:98:200::2/64"]
+| Link | Endpoint | IPv4 | IPv6 |
+| --- | --- | --- | --- |
+| Public | ISP | `76.65.66.1/30` | `2076:65:66::1/64` |
+| Public | Website | `76.65.66.2/30` | `2076:65:66::2/64` |
+| Customer | ISP | `108.97.98.100/31` | `2108:97:98:100::1/64` |
+| Customer | OpenWrt WAN | `108.97.98.101/31` | `2108:97:98:100::2/128` |
+| DMZ | ISP | `108.97.98.200/31` | `2108:97:98:200::1/64` |
+| DMZ | DMZ client | `108.97.98.201/31` | `2108:97:98:200::2/64` |
 
-    website <-->|"Public link · ISP gateway<br/>76.65.66.1/30<br/>2076:65:66::1/64"| isp
-    isp <-->|"DMZ link · ISP gateway<br/>108.97.98.200/31<br/>2108:97:98:200::1/64"| dmz
-
-    subgraph shared["Shared IPv6 2108:97:98:100::/64 · separate L2 links"]
-        wan["Customer link · ISP gateway<br/>108.97.98.100/31<br/>2108:97:98:100::1/64 · fe80::1"]
-        router["OpenWrt WAN<br/>108.97.98.101/31 · 2108:97:98:100::2/128<br/>IPv4 masquerade · IPv6 client /128 routes + NDP proxy<br/>Firewall rejects new inbound TCP to clients"]
-        lan1["LAN1 · 192.168.1.0/24<br/>Gateway .1 · clients .10 and .11<br/>Same-LAN IPv6 stays on the bridge"]
-        others["LAN2–LAN8 · seven separate bridges<br/>IPv4: 192.168.n.0/24 per LAN<br/>Gateway .1 · client .10 · n = 2…8"]
-        wan <--> router
-        router <-->|"eth1"| lan1
-        router <-->|"eth2–eth8"| others
-    end
-    isp <--> wan
-    style shared fill:#eef6ff,stroke:#4477aa
-```
+Configuration and tests calculate addresses from the naming table; the address
+table shows examples for the current names.
 
 The website uses the ISP's `76.65.66.1` and `2076:65:66::1` as its return
 gateways. OpenWrt uses `108.97.98.100` as its direct IPv4 gateway, and the DMZ
@@ -82,12 +68,35 @@ The eight LANs share `2108:97:98:100::/64` with the customer link, using the
 current model of client `/128` routes and NDP proxying across WAN and LANs.
 The customer and DMZ address pools, `108.97.98.0/24` and
 `2108:97:98::/48`, are routed aggregates, not connected link masks; the links
-use the masks shown in the diagram.
+use the masks shown in the address table.
 
 The decimal ASCII codes `108`, `97`, and `98` spell lowercase **lab**;
 `76`, `65`, and `66` spell uppercase **LAB**. The IPv6 forms prepend `2` to
 the zero-padded, three-digit first code: `108` becomes `2108`, and `076`
 becomes `2076`.
+
+### Routing Behavior
+
+The WAN and ISP links use the generated addresses shown above. OpenWrt's
+IPv6 default route uses the ISP's WAN link-local address, `fe80::1`. Its
+`eth1` through `eth8` have `192.168.1.1/24` through `192.168.8.1/24`.
+Clients use `.10` on their LAN; the second LAN1 client uses `192.168.1.11/24`.
+Each client uses its LAN router address as the IPv4 default gateway. OpenWrt
+masquerades outbound IPv4 traffic. All clients receive the generated shared
+customer `/64` as an on-link, autonomous prefix via Router Advertisements
+from the helper. DHCPv6 is disabled on each LAN, and clients do not generate
+temporary IPv6 addresses. The ISP forwards between its three links; the DMZ
+and website use it as their default gateway.
+
+OpenWrt's firewall keeps the normal LAN-to-WAN forwarding, WAN rejection, and
+ICMPv6 forwarding behavior. The in-router helper sends RAs, learns client
+addresses from LAN packets, installs `/128` routes, and proxies NDP for each
+client on WAN and the other seven LANs. It also proxies the ISP's on-link `::1`
+address on every LAN so replies can reach the ISP. The helper does not proxy a
+client address on that client's own LAN, leaving same-LAN traffic on the Docker
+bridge rather than in OpenWrt's forwarding path. A `/128` route sends the ISP's
+`::1` address to WAN; an unreachable route for the shared `/64` rejects unknown
+destinations instead of sending them to the ISP.
 
 ### Expected Traffic
 
@@ -113,29 +122,6 @@ bash tests/address-generation.sh
 
 After changing a naming seed, run `./lab reset` to deploy the new addresses;
 `./lab test` rejects seeds that differ from the running deployment's manifest.
-
-## Routing and Addressing
-
-The WAN and ISP links use the generated addresses shown above. OpenWrt's
-IPv6 default route uses the ISP's WAN link-local address, `fe80::1`. Its
-`eth1` through `eth8` have `192.168.1.1/24` through `192.168.8.1/24`.
-Clients use `.10` on their LAN; the second LAN1 client uses `192.168.1.11/24`.
-Each client uses its LAN router address as the IPv4 default gateway. OpenWrt
-masquerades outbound IPv4 traffic. All clients receive the generated shared
-customer `/64` as an on-link, autonomous prefix via Router Advertisements
-from the helper. DHCPv6 is disabled on each LAN, and clients do not generate
-temporary IPv6 addresses. The ISP forwards between its three links; the DMZ
-and website use it as their default gateway.
-
-OpenWrt's firewall keeps the normal LAN-to-WAN forwarding, WAN rejection, and
-ICMPv6 forwarding behavior. The in-router helper sends RAs, learns client
-addresses from LAN packets, installs `/128` routes, and proxies NDP for each
-client on WAN and the other seven LANs. It also proxies the ISP's on-link `::1`
-address on every LAN so replies can reach the ISP. The helper does not proxy a
-client address on that client's own LAN, leaving same-LAN traffic on the Docker
-bridge rather than in OpenWrt's forwarding path. A `/128` route sends the ISP's
-`::1` address to WAN; an unreachable route for the shared `/64` rejects unknown
-destinations instead of sending them to the ISP.
 
 `test` checks that each client has one global SLAAC address, IPv4 and IPv6
 traffic between every pair of LANs, outbound IPv4 to the ISP, IPv6 in both
