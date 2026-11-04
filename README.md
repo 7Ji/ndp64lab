@@ -45,7 +45,8 @@ Each value must be three ASCII letters, and the two values must differ.
 | `address-seed:customer` | `lab` | ISP identity, customer link, shared LAN IPv6 prefix, and DMZ |
 | `address-seed:public` | `LAB` | Public website link |
 
-The ISP has three separate links. With the names above, their addresses are:
+The ISP has three separate links, and OpenWrt serves eight separate LANs.
+With the names above, their addresses are:
 
 | Link | Endpoint | IPv4 | IPv6 |
 | --- | --- | --- | --- |
@@ -55,9 +56,13 @@ The ISP has three separate links. With the names above, their addresses are:
 | Customer | OpenWrt WAN | `108.97.98.101/31` | `2108:97:98:100::2/128` |
 | DMZ | ISP | `108.97.98.200/31` | `2108:97:98:200::1/64` |
 | DMZ | DMZ client | `108.97.98.201/31` | `2108:97:98:200::2/64` |
+| LAN1–LAN8 | OpenWrt LAN gateways | `192.168.n.1/24` | Link-local RA gateway on each LAN |
+| LAN1–LAN8 | Clients | `192.168.n.10/24`; LAN1 also has `192.168.1.11/24` | SLAAC addresses in `2108:97:98:100::/64`, shared with the customer link |
 
-Configuration and tests calculate addresses from the naming table; the address
-table shows examples for the current names.
+For the LAN rows, `n` is the LAN number, 1 through 8; each LAN has its own
+`192.168.n.0/24` IPv4 subnet. Configuration and tests calculate the ISP link
+addresses and shared IPv6 prefix from the naming table; the address table
+shows examples for the current names.
 
 The website uses the ISP's `76.65.66.1` and `2076:65:66::1` as its return
 gateways. OpenWrt uses `108.97.98.100` as its direct IPv4 gateway, and the DMZ
