@@ -20,6 +20,11 @@ require_tools() {
   [[ $(uname -sm) == 'Linux x86_64' ]] || die 'requires Linux x86_64'
   command -v docker >/dev/null || die 'missing docker'
   docker info >/dev/null || die 'Docker Engine is unavailable'
+  local component version
+  for component in Client Server; do
+    version=$(docker version --format "{{.$component.Version}}")
+    [[ $version =~ ^([0-9]+)\. ]] && (( BASH_REMATCH[1] >= 28 )) || die "Docker $component 28 or newer is required for interface naming"
+  done
   docker buildx version >/dev/null || die 'Docker buildx is unavailable'
 }
 # Only this table in the Topology section supplies address naming seeds.
@@ -61,6 +66,41 @@ load_addresses() {
   dmz6=$customer6:200::2
   isp_public6=$public6::1
   website6=$public6::2
+}
+# Match Docker's historical IPv4-based MAC formula, using intended lab addresses.
+mac_from_ipv4() {
+  local address=$1 octet
+  local -a octets=()
+  [[ $address =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "invalid IPv4 address: $address"
+  IFS=. read -r -a octets <<< "$address"
+  for octet in "${octets[@]}"; do
+    [[ ${#octet} -le 3 ]] && (( 10#$octet <= 255 )) || die "invalid IPv4 address: $address"
+  done
+  printf '02:42:%02x:%02x:%02x:%02x' "$((10#${octets[0]}))" "$((10#${octets[1]}))" \
+    "$((10#${octets[2]}))" "$((10#${octets[3]}))"
+}
+# One row per Ethernet endpoint: container suffix, interface, intended IPv4.
+interface_addresses() {
+  printf '%s\n' "isp eth0 $isp_customer4" "isp eth1 $isp_public4" "isp eth2 $isp_dmz4" \
+    "router eth0 $router4" "website eth0 $website4" "dmz eth0 $dmz4"
+  local n
+  for n in {1..8}; do
+    printf '%s\n' "router eth$n 192.168.$n.1" "client$n eth0 192.168.$n.10"
+  done
+  printf '%s\n' 'client1b eth0 192.168.1.11'
+}
+endpoint_network() {
+  printf 'name=%s,mac-address=%s,driver-opt=com.docker.network.endpoint.ifname=%s' \
+    "$(network "$1")" "$(mac_from_ipv4 "$3")" "$2"
+}
+check_interface_macs() {
+  local name interface address expected actual
+  while read -r name interface address; do
+    expected=$(mac_from_ipv4 "$address")
+    actual=$(dc "$name" cat "/sys/class/net/$interface/address" 2>/dev/null) || actual=missing
+    [[ $actual == "$expected" ]] || die "$name $interface MAC is $actual; expected $expected from $address; run ./lab reset"
+  done < <(interface_addresses)
+  note 'all 23 interface MACs match their IPv4 addresses'
 }
 address_manifest() {
   printf 'shared6=%s\nisp_customer6=%s\nwebsite4=%s\nwebsite6=%s\n' \
@@ -122,41 +162,36 @@ create_networks() {
 }
 start_peers() {
   docker run -d --privileged --name "$(container isp)" --label "$label" \
-    --network "$(network wan)" --mac-address 02:42:ac:20:00:01 "$peer_image" >/dev/null
-  docker network connect "$(network public)" "$(container isp)"
-  docker network connect "$(network dmz)" "$(container isp)"
+    --network "$(endpoint_network wan eth0 "$isp_customer4")" \
+    --network "$(endpoint_network public eth1 "$isp_public4")" \
+    --network "$(endpoint_network dmz eth2 "$isp_dmz4")" "$peer_image" >/dev/null
   docker run -d --privileged --name "$(container dmz)" --label "$label" \
-    --network "$(network dmz)" "$peer_image" >/dev/null
+    --network "$(endpoint_network dmz eth0 "$dmz4")" "$peer_image" >/dev/null
   docker run -d --privileged --name "$(container website)" --label "$label" \
-    --volume "$generated/www:/www:ro" --network "$(network public)" "$peer_image" \
+    --volume "$generated/www:/www:ro" --network "$(endpoint_network public eth0 "$website4")" "$peer_image" \
     httpd -f -p 80 -h /www >/dev/null
-  local n name mac
+  local n name
   for n in {1..8}; do
-    printf -v mac '02:42:ac:10:%02x:0a' "$n"
     name="client$n"
     docker run -d --privileged --name "$(container "$name")" --label "$label" \
-      --network "$(network "$n")" --mac-address "$mac" "$peer_image" >/dev/null
+      --network "$(endpoint_network "$n" eth0 "192.168.$n.10")" "$peer_image" >/dev/null
   done
   docker run -d --privileged --name "$(container client1b)" --label "$label" \
-    --network "$(network 1)" --mac-address 02:42:ac:10:01:0b "$peer_image" >/dev/null
+    --network "$(endpoint_network 1 eth0 192.168.1.11)" "$peer_image" >/dev/null
 }
 start_router() {
-  docker create --privileged --name "$(container router)" --label "$label" \
-    --volume "$generated:/lab:ro" \
-    --network "$(network wan)" --mac-address 02:42:ac:00:00:00 "$router_image" >/dev/null
   local n mac
-  for n in {1..8}; do
-    docker network connect --alias "router$n" "$(network "$n")" "$(container router)"
-  done
+  local -a networks=(--network "$(endpoint_network wan eth0 "$router4")")
   : > "$generated/interfaces.tmp"
-  docker start "$(container router)" >/dev/null
-  for n in {0..8}; do
-    if (( n == 0 )); then mac=$(docker inspect -f "{{(index .NetworkSettings.Networks \"$(network wan)\").MacAddress}}" "$(container router)");
-    else mac=$(docker inspect -f "{{(index .NetworkSettings.Networks \"$(network "$n")\").MacAddress}}" "$(container router)"); fi
-    [[ $mac =~ ^[[:xdigit:]:]{17}$ ]] || die "missing MAC for router LAN$n"
-    printf '%s %s\n' "$n" "$mac" >> "$generated/interfaces.tmp"
+  printf '0 %s\n' "$(mac_from_ipv4 "$router4")" >> "$generated/interfaces.tmp"
+  for n in {1..8}; do
+    networks+=(--network "$(endpoint_network "$n" "eth$n" "192.168.$n.1"),alias=router$n")
+    printf '%s %s\n' "$n" "$(mac_from_ipv4 "192.168.$n.1")" >> "$generated/interfaces.tmp"
   done
   mv "$generated/interfaces.tmp" "$generated/interfaces"
+  docker create --privileged --name "$(container router)" --label "$label" \
+    --volume "$generated:/lab:ro" "${networks[@]}" "$router_image" >/dev/null
+  docker start "$(container router)" >/dev/null
   for n in {0..8}; do
     mac=$(awk -v n="$n" '$1 == n {print $2}' "$generated/interfaces")
     wait_for "router eth$n MAC $mac" "router_mac_matches $n $mac"
@@ -264,6 +299,7 @@ do_test() {
   require_tools
   owned_container "$(container router)" || die 'lab is not up'
   [[ $(cat "$generated/addresses") == "$(address_manifest)" ]] || die 'README address seeds changed; run ./lab reset'
+  check_interface_macs
   local n peer name addr addr1 addr1b peer_mac route neigh proxy_table global_addrs unknown_route
   assert_contains "$(dc router ip -6 route get "$isp_customer6")" 'via fe80::1 dev eth0'
   wait_for 'router ISP on-link connectivity' "dc router ping -6 -c 1 -W 2 $isp_customer6"
@@ -328,7 +364,7 @@ do_test() {
   dc router nft add rule inet ndp64labcheck forward ip6 saddr "$addr1" ip6 daddr "$addr1b" counter
   dc router nft add rule inet ndp64labcheck forward ip6 saddr "$addr1b" ip6 daddr "$addr1" counter
   for name in client1 client1b; do
-    if [[ $name == client1 ]]; then addr=$addr1b; peer_mac=02:42:ac:10:01:0b; else addr=$addr1; peer_mac=02:42:ac:10:01:0a; fi
+    if [[ $name == client1 ]]; then addr=$addr1b; peer_mac=$(mac_from_ipv4 192.168.1.11); else addr=$addr1; peer_mac=$(mac_from_ipv4 192.168.1.10); fi
     route=$(dc "$name" ip -6 route get "$addr")
     assert_contains "$route" 'dev eth0'
     [[ $route != *'via '* ]] || die "$name routes its LAN1 peer through a gateway"

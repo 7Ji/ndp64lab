@@ -8,11 +8,12 @@ generated IPv4 fixtures. No host interface addresses are read.
 
 ## Requirements
 
-Linux x86_64, Docker Engine with buildx, Bash, and permission to create
-privileged containers and bridge networks. The router image builds on the
+Linux x86_64, Docker Engine and CLI 28 or newer with buildx, Bash, and
+permission to create privileged containers and bridge networks. The router image builds on the
 digest-pinned OpenWrt x86/64 24.10.4 container image and builds a static Go
 helper in a separate stage. It installs `ip-full` from OpenWrt's 24.10.4
-package feed, so the first build needs Internet access.
+package feed, so the first build needs Internet access. Docker 28 or newer is
+required for explicit interface naming with `com.docker.network.endpoint.ifname`.
 
 ## Lifecycle
 
@@ -75,6 +76,19 @@ For the LAN rows, `n` is the LAN number, 1 through 8; each LAN has its own
 addresses and shared IPv6 prefix from the naming table; the address table
 shows examples for the current names.
 
+Every Ethernet interface uses `02:42` followed by its four intended IPv4
+octets in hexadecimal, independent of Docker's temporary address allocations.
+For example, the router WAN `108.97.98.101` uses `02:42:6c:61:62:65`,
+LAN1 gateway `192.168.1.1` uses `02:42:c0:a8:01:01`, and its client
+`192.168.1.10` uses `02:42:c0:a8:01:0a`. This reproduces Docker's historical
+IPv4-based formula explicitly and most importantly make both the MAC address
+and IPv6 SLAAC addresses predictable; Docker >=28 otherwise generate random
+MACs. The `02` byte marks a locally administered unicast address. Each ISP
+link uses its own IPv4 address; the ISP loopback identity supplies no MAC.
+All networks are attached at container creation with explicit MACs and
+interface names: ISP WAN/public/DMZ are `eth0`/`eth1`/`eth2`, router WAN is
+`eth0` and LAN1–LAN8 are `eth1`–`eth8`, and each peer uses `eth0`.
+
 The website uses the ISP's `76.65.66.1` and `2076:65:66::1` as its return
 gateways. OpenWrt uses `108.97.98.100` as its direct IPv4 gateway, and the DMZ
 client uses `108.97.98.200`. The ISP keeps `108.97.98.1/32` as a separate
@@ -125,7 +139,8 @@ Acceptance checks cover:
 - New inbound TCP connections to lab clients remain blocked by OpenWrt's
   firewall. Inbound IPv4 access to lab clients is not promised.
 
-The address generator and payload creation can also be checked without Docker:
+The address generator, MAC vectors and uniqueness, and payload creation can
+also be checked without Docker:
 
 ```sh
 bash tests/address-generation.sh
@@ -133,6 +148,10 @@ bash tests/address-generation.sh
 
 After changing a naming seed, run `./lab reset` to deploy the new addresses;
 `./lab test` rejects seeds that differ from the running deployment's manifest.
+
+Existing deployments need `./lab reset` to apply the MAC formula; client SLAAC
+addresses may change. `test` checks all 23 interface MACs against their intended
+IPv4 addresses and reports mismatches with reset instructions.
 
 `test` checks that each client has one global SLAAC address, IPv4 and IPv6
 traffic between every pair of LANs, outbound IPv4 to the ISP, IPv6 in both

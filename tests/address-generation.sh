@@ -15,11 +15,53 @@ load_addresses
 [[ $isp_identity4 == 108.97.98.1 && $router4 == 108.97.98.101 && $dmz4 == 108.97.98.201 ]]
 [[ $shared6 == 2108:97:98:100:: && $website6 == 2076:65:66::2 ]]
 
+# Known vectors cover every endpoint role and decimal octets with leading zeroes.
+while read -r address expected; do
+  [[ $(mac_from_ipv4 "$address") == "$expected" ]]
+done <<'VECTORS'
+108.97.98.100 02:42:6c:61:62:64
+108.97.98.101 02:42:6c:61:62:65
+76.65.66.1 02:42:4c:41:42:01
+76.65.66.2 02:42:4c:41:42:02
+108.97.98.200 02:42:6c:61:62:c8
+108.97.98.201 02:42:6c:61:62:c9
+192.168.1.1 02:42:c0:a8:01:01
+192.168.8.10 02:42:c0:a8:08:0a
+192.168.1.11 02:42:c0:a8:01:0b
+000.008.016.255 02:42:00:08:10:ff
+VECTORS
+for bad in '' 1.2.3 1.2.3.4.5 256.2.3.4 1.-2.3.4 1.2.3.x 0000.2.3.4; do
+  if (mac_from_ipv4 "$bad") > "$fixture/error" 2>&1; then
+    printf 'accepted invalid IPv4: %s\n' "$bad" >&2; exit 1
+  fi
+done
+check_endpoint_macs() {
+  local name interface address mac count=0 first
+  local -A seen=()
+  while read -r name interface address; do
+    mac=$(mac_from_ipv4 "$address")
+    [[ ! -v seen[$mac] ]]
+    seen[$mac]=1
+    first=${mac%%:*}
+    (( (16#$first & 3) == 2 )) # Locally administered and unicast.
+    count=$((count + 1))
+  done < <(interface_addresses)
+  [[ $count == 23 && ${#seen[@]} == 23 ]]
+}
+check_endpoint_macs
+
 # The examples remain unchanged; only changing the naming table must change config.
 sed -e 's/| `lab` |/| `abc` |/' -e 's/| `LAB` |/| `ABC` |/' "$fixture/baseline" > "$here/README.md"
 load_addresses
 [[ $isp_identity4 == 97.98.99.1 && $router4 == 97.98.99.101 && $dmz4 == 97.98.99.201 ]]
 [[ $shared6 == 2097:98:99:100:: && $website6 == 2065:66:67::2 ]]
+[[ $(mac_from_ipv4 "$isp_customer4") == 02:42:61:62:63:64 ]]
+[[ $(mac_from_ipv4 "$router4") == 02:42:61:62:63:65 ]]
+[[ $(mac_from_ipv4 "$isp_dmz4") == 02:42:61:62:63:c8 ]]
+[[ $(mac_from_ipv4 "$dmz4") == 02:42:61:62:63:c9 ]]
+[[ $(mac_from_ipv4 "$isp_public4") == 02:42:41:42:43:01 ]]
+[[ $(mac_from_ipv4 "$website4") == 02:42:41:42:43:02 ]]
+check_endpoint_macs
 mkdir "$here/router"
 cp "$repo/router/network" "$here/router/network"
 generated=$here/generated
@@ -35,6 +77,26 @@ prepare_configuration
 if cmp -s "$fixture/first-payload" "$generated/www/index.html"; then
   printf 'deployment payload was reused\n' >&2; exit 1
 fi
+
+# A stale deployment must fail early with the endpoint and reset instruction.
+fixture_bad_mac=0
+dc() {
+  local name interface address
+  while read -r name interface address; do
+    if [[ $name == "$1" && /sys/class/net/$interface/address == "$3" ]]; then
+      if (( fixture_bad_mac == 1 )); then printf '%s\n' '02:42:00:00:00:00'
+      else mac_from_ipv4 "$address"; fi
+      return
+    fi
+  done < <(interface_addresses)
+  return 1
+}
+check_interface_macs
+fixture_bad_mac=1
+if (check_interface_macs) > "$fixture/error" 2>&1; then
+  printf 'accepted a stale interface MAC\n' >&2; exit 1
+fi
+grep -q 'isp eth0 MAC is .*; expected 02:42:61:62:63:64 .*run ./lab reset' "$fixture/error"
 
 # HTTP success alone must not pass: the complete response must match the file.
 response_fixture=$fixture/response
@@ -73,4 +135,4 @@ printf '\n## Other\n| `address-seed:public` | `ABC` | ignored |\n' >> "$here/REA
 if (load_addresses) > "$fixture/error" 2>&1; then
   printf 'accepted a seed outside Topology\n' >&2; exit 1
 fi
-printf 'address generation and deployment payload checks passed\n'
+printf 'address generation, interface MAC and deployment payload checks passed\n'
