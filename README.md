@@ -51,6 +51,11 @@ Each value must be three ASCII letters, and the two values must differ.
 | `address-seed:customer` | `lab` | ISP identity, customer link, shared LAN IPv6 prefix, and DMZ |
 | `address-seed:public` | `LAB` | Public website link |
 
+_The `ASCII name`s are parsed as decimal ASCII codes, `lab` as 108, 97, 98, and
+`LAB` as 76, 65, 66; they are used to compose the IPv4 or IPv6 prefixes; the
+IPv6 prefix first part addtionally has `2` prepended to zero-padded, 3-digit
+code so `108 -> 2108`, `76 -> 2076`_
+
 The ISP has three separate links, and OpenWrt serves eight separate LANs.
 With the names above, their addresses are:
 
@@ -80,11 +85,6 @@ current model of client `/128` routes and NDP proxying across WAN and LANs.
 The customer and DMZ address pools, `108.97.98.0/24` and
 `2108:97:98::/48`, are routed aggregates, not connected link masks; the links
 use the masks shown in the address table.
-
-The decimal ASCII codes `108`, `97`, and `98` spell lowercase **lab**;
-`76`, `65`, and `66` spell uppercase **LAB**. The IPv6 forms prepend `2` to
-the zero-padded, three-digit first code: `108` becomes `2108`, and `076`
-becomes `2076`.
 
 ### Routing Behavior
 
