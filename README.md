@@ -64,9 +64,9 @@ With the names above, their addresses are:
 | --- | --- | --- | --- |
 | Public | ISP | `76.65.66.1/30` | `2076:65:66::1/64` |
 | Public | Website | `76.65.66.2/30` | `2076:65:66::2/64` |
-| Customer | ISP | `108.97.98.100/31` | `2108:97:98:100::1/64` |
+| Customer | ISP | `108.97.98.100/31` | `2108:97:98:100::1/128` |
 | Customer | OpenWrt WAN | `108.97.98.101/31` | `2108:97:98:100::2/128` |
-| DMZ | ISP | `108.97.98.200/31` | `2108:97:98:200::1/64` |
+| DMZ | ISP | `108.97.98.200/31` | `2108:97:98:200::1/128` |
 | DMZ | DMZ client | `108.97.98.201/31` | `2108:97:98:200::2/64` |
 | LAN1–LAN8 | OpenWrt LAN gateways | `192.168.n.1/24` | Link-local RA gateway on each LAN |
 | LAN1–LAN8 | Clients | `192.168.n.10/24`; LAN1 also has `192.168.1.11/24` | SLAAC addresses in `2108:97:98:100::/64`, shared with the customer link |
@@ -113,6 +113,26 @@ from the helper. DHCPv6 is disabled on each LAN, and clients do not generate
 temporary IPv6 addresses. The ISP forwards between its three links; the DMZ
 and website use it as their default gateway.
 
+The customer and DMZ links model **bad ISP behaviour**: the ISP is
+"providing" a `/64` yet takes `::1/128` for itself, and therefore expects
+Neighbor Solicitations (NS) from the client to add that client to its route
+and neighbor tables. It starts with no connected route for either offered
+`/64` and no client routes or neighbors. An NS addressed to the ISP's `::1`,
+with a source in that link's `/64` and a source link-layer address option,
+registers an on-link `/128` route and the client's MAC in the neighbor table.
+Ordinary IPv6 traffic, Neighbor Advertisements, and DAD probes do not register
+clients. Addresses that have not registered remain unreachable from the ISP.
+The public website link keeps normal connected `/64` routing.
+
+The DMZ client registers through normal gateway NS. OpenWrt explicitly sends
+an NS from each learned LAN client's IPv6 address to the ISP's customer `::1`,
+using its WAN MAC, because forwarding a client's traffic does not generate
+an NS with that client's source address. It also registers its own WAN address.
+Return traffic uses the learned neighbor entry and OpenWrt's client `/128`
+routes; subsequent NDP is answered by OpenWrt's proxy. The ISP learners log to
+`/tmp/isp-learning-eth0.log` and `/tmp/isp-learning-eth2.log` inside the ISP
+container. Existing deployments need `./lab reset` to apply this behavior.
+
 OpenWrt's firewall keeps the normal LAN-to-WAN forwarding, WAN rejection, and
 ICMPv6 forwarding behavior. The in-router helper sends RAs, learns client
 addresses from LAN packets, installs `/128` routes, and proxies NDP for each
@@ -144,6 +164,7 @@ also be checked without Docker:
 
 ```sh
 bash tests/address-generation.sh
+go test ndp-helper.go ndp-helper_test.go  # NS encoding and validation
 ```
 
 After changing a naming seed, run `./lab reset` to deploy the new addresses;
@@ -158,7 +179,13 @@ traffic between every pair of LANs, outbound IPv4 to the ISP, IPv6 in both
 directions with the ISP and DMZ, HTTP payload integrity over both protocols
 from every lab client and the DMZ, upstream NDP, blocked new inbound TCP, and
 direct LAN1 peer routing and MAC resolution. It also checks that unknown addresses in the
-shared prefix are unreachable. A temporary nftables counter checks that LAN1
+shared prefix are unreachable from both OpenWrt and the ISP, that the ISP
+customer and DMZ addresses use `/128`, and that each active client has a
+learned ISP `/128` route and neighbor entry. Deployment checks that the ISP
+starts without client routes on either link.
+A temporary DMZ source verifies that ordinary traffic cannot register a client
+and that a subsequent gateway NS installs both its route and neighbor entry.
+A temporary nftables counter checks that LAN1
 peer traffic does not enter OpenWrt's forwarding path.
 
 When diagnosing a failed run, `./lab exec router logread` shows

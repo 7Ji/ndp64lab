@@ -210,11 +210,16 @@ configure_peers() {
   dc isp ip -4 addr add "$isp_identity4/32" dev lo
   dc isp ip -4 addr add "$isp_customer4/31" dev eth0
   dc isp ip -6 addr add fe80::1/64 dev eth0
-  dc isp ip -6 addr add "$isp_customer6/64" dev eth0
+  dc isp ip -6 addr add "$isp_customer6/128" dev eth0
   dc isp ip -4 addr add "$isp_public4/30" dev eth1
   dc isp ip -6 addr add "$isp_public6/64" dev eth1
   dc isp ip -4 addr add "$isp_dmz4/31" dev eth2
-  dc isp ip -6 addr add "$isp_dmz6/64" dev eth2
+  dc isp ip -6 addr add "$isp_dmz6/128" dev eth2
+  [[ $(dc isp ip -6 route show root "$shared6/64" dev eth0 | awk '{print $1}') == "$isp_customer6" ]] || die 'ISP starts with unexpected customer routes'
+  [[ $(dc isp ip -6 route show root "$customer6:200::/64" dev eth2 | awk '{print $1}') == "$isp_dmz6" ]] || die 'ISP starts with unexpected DMZ routes'
+  docker exec -d "$(container isp)" sh -c 'exec /usr/sbin/lab-ndp isp "$1" "$2" eth0 >/tmp/isp-learning-eth0.log 2>&1' sh "$shared6/64" "$isp_customer6"
+  docker exec -d "$(container isp)" sh -c 'exec /usr/sbin/lab-ndp isp "$1" "$2" eth2 >/tmp/isp-learning-eth2.log 2>&1' sh "$customer6:200::/64" "$isp_dmz6"
+  wait_for 'ISP NS learners' '[[ $(dc isp pidof lab-ndp | wc -w) -eq 2 ]]'
   for name in dmz website; do
     dc "$name" ip -4 addr flush dev eth0
     dc "$name" sysctl -w net.ipv6.conf.eth0.disable_ipv6=0 >/dev/null
@@ -294,6 +299,29 @@ check_website() {
   done
   rm -f "$response"
 }
+check_isp_ns_learning() {
+  local probe=$customer6:200::1234
+  # Clear a previous interrupted check, then force data traffic without NS.
+  dc dmz ip -6 addr del "$probe/128" dev eth0 >/dev/null 2>&1 || true
+  dc isp ip -6 route del "$probe/128" dev eth2 >/dev/null 2>&1 || true
+  dc isp ip -6 neigh del "$probe" dev eth2 >/dev/null 2>&1 || true
+  dc dmz ip -6 addr add "$probe/128" dev eth0 nodad
+  dc dmz ip -6 neigh replace "$isp_dmz6" lladdr "$(mac_from_ipv4 "$isp_dmz4")" nud permanent dev eth0
+  if dc dmz ping -6 -I "$probe" -c 1 -W 1 "$website6" >/dev/null 2>&1; then
+    die 'ISP returned traffic to a source that never sent NS'
+  fi
+  [[ -z $(dc isp ip -6 route show exact "$probe/128") ]] || die 'ISP learned a route from ordinary traffic'
+  [[ -z $(dc isp ip -6 neigh show "$probe" dev eth2) ]] || die 'ISP learned a neighbor from ordinary traffic'
+  # Force a real gateway NS using the probe as its source, then check both tables.
+  dc dmz ip -6 neigh del "$isp_dmz6" dev eth0
+  wait_for 'DMZ probe NS registration' "dc dmz ping -6 -I $probe -c 1 -W 2 $website6"
+  assert_contains "$(dc isp ip -6 route show exact "$probe/128")" "$probe dev eth2"
+  assert_contains "$(dc isp ip -6 neigh show "$probe" dev eth2)" "$(mac_from_ipv4 "$dmz4")"
+  dc dmz ip -6 addr del "$probe/128" dev eth0
+  dc isp ip -6 route del "$probe/128" dev eth2
+  dc isp ip -6 neigh del "$probe" dev eth2
+  note 'ISP ignores ordinary sources and learns route/neighbor from NS'
+}
 do_test() {
   load_addresses
   require_tools
@@ -301,6 +329,18 @@ do_test() {
   [[ $(cat "$generated/addresses") == "$(address_manifest)" ]] || die 'README address seeds changed; run ./lab reset'
   check_interface_macs
   local n peer name addr addr1 addr1b peer_mac route neigh proxy_table global_addrs unknown_route
+  assert_contains "$(dc isp ip -o -6 addr show dev eth0 scope global)" "$isp_customer6/128"
+  assert_contains "$(dc isp ip -o -6 addr show dev eth2 scope global)" "$isp_dmz6/128"
+  if unknown_route=$(dc isp ip -6 route get "${shared6}dead:beef" 2>&1); then
+    die "ISP has a route to an unseen customer: $unknown_route; run ./lab reset"
+  fi
+  if unknown_route=$(dc isp ip -6 route get "$customer6:200::dead:beef" 2>&1); then
+    die "ISP has a route to an unseen DMZ client: $unknown_route; run ./lab reset"
+  fi
+  wait_for 'DMZ NS registration and ISP connectivity' "dc dmz ping -6 -c 1 -W 2 $isp_dmz6"
+  assert_contains "$(dc isp ip -6 route show exact "$dmz6/128")" "$dmz6 dev eth2"
+  assert_contains "$(dc isp ip -6 neigh show "$dmz6" dev eth2)" "$(mac_from_ipv4 "$dmz4")"
+  check_isp_ns_learning
   assert_contains "$(dc router ip -6 route get "$isp_customer6")" 'via fe80::1 dev eth0'
   wait_for 'router ISP on-link connectivity' "dc router ping -6 -c 1 -W 2 $isp_customer6"
   if unknown_route=$(dc router ip -6 route get "${shared6}dead:beef" 2>&1); then
@@ -328,6 +368,8 @@ do_test() {
     wait_for "$name IPv6 WAN connectivity" "dc $name ping -6 -I $addr -c 1 -W 2 ${dmz6}"
     wait_for "$name ISP on-link connectivity" "dc $name ping -6 -I $addr -c 1 -W 2 ${isp_customer6}"
     wait_for "$name route installation" "dc router ip -6 route get $addr | grep -q 'dev eth$n'"
+    assert_contains "$(dc isp ip -6 route show exact "$addr/128")" "$addr dev eth0"
+    assert_contains "$(dc isp ip -6 neigh show "$addr" dev eth0)" "$(mac_from_ipv4 "$router4")"
     dc isp ping -6 -c 1 -W 2 "$addr" >/dev/null || die "ISP cannot reach $name"
     assert_contains "$(dc router ip -6 neigh show proxy dev eth0)" "$addr"
     dc dmz ping -6 -c 1 -W 2 "$addr" >/dev/null || die "DMZ cannot reach $name"

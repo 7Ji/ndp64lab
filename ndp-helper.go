@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -18,6 +19,7 @@ var subnet *net.IPNet
 type sighting struct {
 	addr string
 	lan  int
+	mac  string
 }
 
 func command(args ...string) error {
@@ -28,7 +30,7 @@ func command(args ...string) error {
 	return nil
 }
 
-func watch(lan int, found chan<- sighting) {
+func watch(lan int, found chan<- sighting, nsTarget net.IP) {
 	iface, err := net.InterfaceByName(fmt.Sprintf("eth%d", lan))
 	if err != nil {
 		log.Fatal(err)
@@ -58,7 +60,14 @@ func watch(lan int, found chan<- sighting) {
 		if !subnet.Contains(ip) || ip.Equal(prefix) {
 			continue
 		}
-		found <- sighting{ip.String(), lan}
+		mac := ""
+		if nsTarget != nil {
+			mac = solicitationMAC(buf[:n], nsTarget)
+			if mac == "" {
+				continue
+			}
+		}
+		found <- sighting{addr: ip.String(), lan: lan, mac: mac}
 	}
 }
 
@@ -99,20 +108,33 @@ func advertise(lan int) {
 }
 
 func main() {
-	if len(os.Args) != 3 {
-		log.Fatal("usage: lab-ndp PREFIX/64 ISP_ADDRESS")
+	isp := len(os.Args) > 1 && os.Args[1] == "isp"
+	args := os.Args[1:]
+	if isp {
+		args = args[1:]
+	}
+	if (!isp && len(args) != 2) || (isp && len(args) != 3) {
+		log.Fatal("usage: lab-ndp PREFIX/64 ISP_ADDRESS | lab-ndp isp PREFIX/64 ISP_ADDRESS ethN")
 	}
 	var err error
-	prefix, subnet, err = net.ParseCIDR(os.Args[1])
+	prefix, subnet, err = net.ParseCIDR(args[0])
 	if err != nil {
 		log.Fatal(err)
 	}
 	ones, bits := subnet.Mask.Size()
-	upstream := net.ParseIP(os.Args[2])
+	upstream := net.ParseIP(args[1])
 	if ones != 64 || bits != 128 || !prefix.Equal(subnet.IP) || upstream == nil || !subnet.Contains(upstream) || upstream.Equal(prefix) {
 		log.Fatal("expected an IPv6 /64 network and an ISP address within it")
 	}
 	prefix = prefix.To16()
+	if isp {
+		port, err := strconv.Atoi(strings.TrimPrefix(args[2], "eth"))
+		if err != nil || args[2] != fmt.Sprintf("eth%d", port) || port < 0 {
+			log.Fatal("expected an ethN interface")
+		}
+		learnISPRoutes(upstream, port)
+		return
+	}
 
 	if err := os.WriteFile("/proc/sys/net/ipv6/conf/all/forwarding", []byte("1"), 0644); err != nil {
 		log.Fatal(err)
@@ -122,6 +144,22 @@ func main() {
 	}
 	if err := command("-6", "route", "replace", "unreachable", prefix.String()+"/64"); err != nil {
 		log.Fatal(err)
+	}
+	wan, err := net.InterfaceByName("eth0")
+	if err != nil {
+		log.Fatal(err)
+	}
+	wanAddresses, err := wan.Addrs()
+	if err != nil {
+		log.Fatal(err)
+	}
+	for _, address := range wanAddresses {
+		ip, _, err := net.ParseCIDR(address.String())
+		if err == nil && subnet.Contains(ip) {
+			if err := registerUpstream(ip, upstream); err != nil {
+				log.Fatal(err)
+			}
+		}
 	}
 	for i := 0; i <= 8; i++ {
 		if err := os.WriteFile(fmt.Sprintf("/proc/sys/net/ipv6/conf/eth%d/proxy_ndp", i), []byte("1"), 0644); err != nil {
@@ -133,7 +171,7 @@ func main() {
 		if err := command("-6", "neigh", "replace", "proxy", upstream.String(), "dev", fmt.Sprintf("eth%d", i)); err != nil {
 			log.Fatal(err)
 		}
-		go watch(i, found)
+		go watch(i, found, nil)
 		go advertise(i)
 	}
 	known := make(map[string]int)
@@ -159,6 +197,121 @@ func main() {
 			}
 		}
 		known[s.addr] = s.lan
+		if err := registerUpstream(net.ParseIP(s.addr), upstream); err != nil {
+			log.Print(err)
+			delete(known, s.addr) // Retry on the next sighting.
+		}
 		log.Printf("LAN%d %s", s.lan, s.addr)
 	}
+}
+
+// Model the bad ISP: learn a host route and neighbor only from an NS for ::1.
+func learnISPRoutes(own net.IP, port int) {
+	found := make(chan sighting, 256)
+	go watch(port, found, own)
+	iface := fmt.Sprintf("eth%d", port)
+	for s := range found {
+		if s.addr == own.String() {
+			continue
+		}
+		if err := command("-6", "neigh", "replace", s.addr, "lladdr", s.mac, "nud", "stale", "dev", iface); err != nil {
+			log.Print(err)
+			continue
+		}
+		if err := command("-6", "route", "replace", s.addr+"/128", "dev", iface); err != nil {
+			log.Print(err)
+			continue
+		}
+		log.Printf("NS %s %s on %s", s.addr, s.mac, iface)
+	}
+}
+
+func checksum(data []byte) uint16 {
+	var sum uint32
+	for len(data) >= 2 {
+		sum += uint32(binary.BigEndian.Uint16(data))
+		data = data[2:]
+	}
+	if len(data) == 1 {
+		sum += uint32(data[0]) << 8
+	}
+	for sum>>16 != 0 {
+		sum = (sum & 0xffff) + (sum >> 16)
+	}
+	return ^uint16(sum)
+}
+
+func icmpChecksum(packet []byte) uint16 {
+	pseudo := make([]byte, 40, len(packet))
+	copy(pseudo, packet[8:40]) // IPv6 source and destination.
+	binary.BigEndian.PutUint32(pseudo[32:36], uint32(len(packet)-40))
+	pseudo[39] = 58
+	return checksum(append(pseudo, packet[40:]...))
+}
+
+// Accept a direct ICMPv6 NS with a source link-layer address option. DAD
+// (unspecified source) and sources outside the offered /64 are filtered by watch.
+func solicitationMAC(frame []byte, target net.IP) string {
+	if len(frame) < 14+40+32 {
+		return ""
+	}
+	packet := frame[14:]
+	length := 40 + int(binary.BigEndian.Uint16(packet[4:6]))
+	if length > len(packet) || length < 72 || packet[6] != 58 || packet[7] != 255 {
+		return ""
+	}
+	packet = packet[:length]
+	if packet[40] != 135 || packet[41] != 0 || !net.IP(packet[48:64]).Equal(target) || icmpChecksum(packet) != 0 {
+		return ""
+	}
+	for option := packet[64:]; len(option) >= 2; {
+		size := int(option[1]) * 8
+		if size == 0 || size > len(option) {
+			return ""
+		}
+		if option[0] == 1 && size == 8 {
+			mac := net.HardwareAddr(option[2:8])
+			if mac[0]&1 != 0 || mac.String() != net.HardwareAddr(frame[6:12]).String() {
+				return ""
+			}
+			return mac.String()
+		}
+		option = option[size:]
+	}
+	return ""
+}
+
+// Forwarded client traffic does not make Linux send NS using that client's
+// source address. Register it explicitly with the ISP using the WAN MAC.
+func registerUpstream(source, target net.IP) error {
+	iface, err := net.InterfaceByName("eth0")
+	if err != nil {
+		return err
+	}
+	frame := solicitationFrame(source, target, iface.HardwareAddr)
+	fd, err := syscall.Socket(syscall.AF_PACKET, syscall.SOCK_RAW, 0xdd86)
+	if err != nil {
+		return err
+	}
+	defer syscall.Close(fd)
+	return syscall.Sendto(fd, frame, 0, &syscall.SockaddrLinklayer{Ifindex: iface.Index, Halen: 6, Addr: [8]byte{frame[0], frame[1], frame[2], frame[3], frame[4], frame[5]}})
+}
+
+func solicitationFrame(source, target net.IP, mac net.HardwareAddr) []byte {
+	target = target.To16()
+	frame := make([]byte, 14+40+32)
+	copy(frame, []byte{0x33, 0x33, 0xff, target[13], target[14], target[15]})
+	copy(frame[6:12], mac)
+	binary.BigEndian.PutUint16(frame[12:14], 0x86dd)
+	packet := frame[14:]
+	packet[0], packet[6], packet[7] = 0x60, 58, 255
+	binary.BigEndian.PutUint16(packet[4:6], 32)
+	copy(packet[8:24], source.To16())
+	copy(packet[24:40], []byte{0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0xff, target[13], target[14], target[15]})
+	packet[40] = 135
+	copy(packet[48:64], target)
+	packet[64], packet[65] = 1, 1
+	copy(packet[66:72], mac)
+	binary.BigEndian.PutUint16(packet[42:44], icmpChecksum(packet))
+	return frame
 }
