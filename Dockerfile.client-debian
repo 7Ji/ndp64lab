@@ -1,9 +1,14 @@
+FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc AS certificates
+
 FROM debian:trixie-slim
+# Bootstrap HTTPS APT feeds without installing tools from upstream first.
+COPY --from=certificates /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 ARG LAB_ID
+COPY --from=repositories / /
 LABEL org.ndp64lab.owner="$LAB_ID"
-RUN apt-get update \
-    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-       systemd systemd-sysv udev dbus network-manager iproute2 iputils-ping curl python3 procps \
+RUN apt-get -o Acquire::https::CaInfo=/etc/ssl/certs/ca-certificates.crt update \
+    && DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::https::CaInfo=/etc/ssl/certs/ca-certificates.crt install -y --no-install-recommends \
+       ca-certificates systemd systemd-sysv udev dbus network-manager iproute2 iputils-ping curl python3 procps \
     && rm -rf /var/lib/apt/lists/* \
     && systemctl mask systemd-resolved.service systemd-firstboot.service \
     && mkdir -p /etc/systemd/system/systemd-udev-trigger.service.d \

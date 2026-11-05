@@ -5,6 +5,7 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o
 
 FROM openwrt/rootfs:x86-64-24.10.4@sha256:1310ccbd24f30b3df6e210a48dbd0fb902445ee80e21ffc8b8e882b94987a411
 ARG LAB_ID
+COPY --from=repositories / /
 LABEL org.ndp64lab.owner="$LAB_ID"
 RUN mkdir -p /var/lock /tmp && opkg update && opkg install ip-full \
     && uci -q delete 'firewall.@zone[0].network' \

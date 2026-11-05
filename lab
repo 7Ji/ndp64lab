@@ -257,19 +257,52 @@ wait_for() {
     sleep 1
   done
 }
+prepare_build_repositories() {
+  local image=$1 destination=$2 architecture=x86_64
+  mkdir -p "$destination"
+  # Read the base image's real feed files without giving it network access.
+  docker run --rm --network none --read-only --entrypoint /bin/sh "$image" -c '
+    cd /
+    set --
+    for file in etc/opkg/distfeeds.conf etc/apk/repositories etc/apk/repositories.d/*.list \
+                etc/apt/sources.list etc/apt/sources.list.d/*.list etc/apt/sources.list.d/*.sources; do
+      [ ! -f "$file" ] || set -- "$@" "$file"
+    done
+    [ "$#" -gt 0 ] || exit 1
+    tar -cf - "$@"
+  ' | tar -xf - -C "$destination"
+  if [[ -f $destination/etc/apk/repositories ]]; then
+    architecture=$(docker run --rm --network none --read-only --entrypoint /sbin/apk "$image" --print-arch)
+  fi
+  sh "$here/build/configure-mirror.sh" "${BUILD_MIRROR:-}" "$destination" "$architecture"
+}
+build_image() {
+  local dockerfile=$1 image=$2 base=$3
+  shift 3
+  local repositories
+  repositories=$(mktemp -d "$generated/repositories.XXXXXX")
+  prepare_build_repositories "$base" "$repositories"
+  docker buildx build --builder "$builder" --load --build-arg "LAB_ID=$prefix" \
+    --build-context "repositories=$repositories" "$@" -f "$here/$dockerfile" -t "$image" "$here"
+  rm -rf -- "$repositories"
+}
 build_images() {
+  if [[ -n ${BUILD_MIRROR:-} ]]; then command -v curl >/dev/null || die 'BUILD_MIRROR requires curl on the host'; fi
   mkdir -p "$generated"
   if [[ ! -e "$generated/builder-owned" ]]; then
     docker buildx inspect "$builder" >/dev/null 2>&1 && die "builder $builder exists without ownership marker"
     touch "$generated/builder-owned"
     docker buildx create --name "$builder" --driver docker-container >/dev/null
   fi
-  docker buildx build --builder "$builder" --load --build-arg "LAB_ID=$prefix" -f "$here/Dockerfile.peer" -t "$peer_image" "$here"
-  docker buildx build --builder "$builder" --load --build-arg "LAB_ID=$prefix" -f "$here/Dockerfile.router" -t "$router_image" "$here"
-  docker buildx build --builder "$builder" --load --build-arg "LAB_ID=$prefix" -f "$here/Dockerfile.client-debian" -t "$debian_image" "$here"
-  docker buildx build --builder "$builder" --load --build-arg "LAB_ID=$prefix" -f "$here/Dockerfile.client-alpine" -t "$alpine_image" "$here"
-  docker buildx build --builder "$builder" --load --build-arg "LAB_ID=$prefix" --build-arg "OPENWRT_IMAGE=$fw3_base" -f "$here/Dockerfile.client-openwrt" -t "$fw3_image" "$here"
-  docker buildx build --builder "$builder" --load --build-arg "LAB_ID=$prefix" --build-arg "OPENWRT_IMAGE=$fw4_base" -f "$here/Dockerfile.client-openwrt" -t "$fw4_image" "$here"
+  local alpine_base router_base
+  alpine_base=$(awk '$1 == "FROM" {base=$2} END {print base}' "$here/Dockerfile.client-alpine")
+  router_base=$(awk '$1 == "FROM" {base=$2} END {print base}' "$here/Dockerfile.router")
+  build_image Dockerfile.peer "$peer_image" "$alpine_base"
+  build_image Dockerfile.router "$router_image" "$router_base"
+  build_image Dockerfile.client-debian "$debian_image" debian:trixie-slim
+  build_image Dockerfile.client-alpine "$alpine_image" "$alpine_base"
+  build_image Dockerfile.client-openwrt "$fw3_image" "$fw3_base" --build-arg "OPENWRT_IMAGE=$fw3_base"
+  build_image Dockerfile.client-openwrt "$fw4_image" "$fw4_base" --build-arg "OPENWRT_IMAGE=$fw4_base"
 }
 create_networks() {
   local segment
@@ -341,6 +374,15 @@ start_router() {
   wait_for 'OpenWrt helper' 'dc router pidof lab-ndp'
   wait_for 'OpenWrt firewall' 'dc router nft list table inet fw4'
 }
+isp_link_local() {
+  dc isp ip -o -6 addr show dev eth0 scope link | awk '!/tentative|dadfailed/ {split($4, address, "/"); print address[1]; exit}'
+}
+configure_router_gateway() {
+  local gateway
+  wait_for 'ISP customer link-local address' '[[ -n $(isp_link_local) ]]'
+  gateway=$(isp_link_local)
+  sed -i "s/@GATEWAY6@/$gateway/g" "$generated/network"
+}
 configure_peers() {
   local name port
   for port in eth0 eth1 eth2; do
@@ -350,12 +392,12 @@ configure_peers() {
   dc isp sysctl -w net.ipv4.ip_forward=1 net.ipv6.conf.all.forwarding=1 >/dev/null
   dc isp ip -4 addr add "$isp_identity4/32" dev lo
   dc isp ip -4 addr add "$isp_customer4/31" dev eth0
-  dc isp ip -6 addr add fe80::1/64 dev eth0
   dc isp ip -6 addr add "$isp_customer6/128" dev eth0
   dc isp ip -4 addr add "$isp_public4/30" dev eth1
   dc isp ip -6 addr add "$isp_public6/64" dev eth1
   dc isp ip -4 addr add "$isp_dmz4/31" dev eth2
   dc isp ip -6 addr add "$isp_dmz6/128" dev eth2
+  configure_router_gateway
   [[ $(dc isp ip -6 route show root "$shared6/64" dev eth0 | awk '{print $1}') == "$isp_customer6" ]] || die 'ISP starts with unexpected customer routes'
   [[ $(dc isp ip -6 route show root "$customer6:200::/64" dev eth2 | awk '{print $1}') == "$isp_dmz6" ]] || die 'ISP starts with unexpected DMZ routes'
   docker exec -d "$(container isp)" sh -c 'exec /usr/sbin/lab-ndp isp "$1" "$2" eth0 >/tmp/isp-learning-eth0.log 2>&1' sh "$shared6/64" "$isp_customer6"
@@ -500,7 +542,11 @@ do_test() {
   assert_contains "$(dc isp ip -6 route show exact "$dmz6/128")" "$dmz6 dev eth2"
   assert_contains "$(dc isp ip -6 neigh show "$dmz6" dev eth2)" "$(mac_from_ipv4 "$dmz4")"
   check_isp_ns_learning
-  assert_contains "$(dc router ip -6 route get "$isp_customer6")" 'via fe80::1 dev eth0'
+  local gateway
+  gateway=$(isp_link_local)
+  [[ -n $gateway ]] || die 'ISP customer link-local address is missing'
+  assert_contains "$(dc router ip -6 route show default)" "via $gateway dev eth0"
+  assert_contains "$(dc router ip -6 route get "$isp_customer6")" "via $gateway dev eth0"
   wait_for 'router ISP on-link connectivity' "dc router ping -6 -c 1 -W 2 $isp_customer6"
   if unknown_route=$(dc router ip -6 route get "${shared6}dead:beef" 2>&1); then
     die "unknown shared-prefix address routes via WAN: $unknown_route"

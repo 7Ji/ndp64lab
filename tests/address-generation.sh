@@ -78,6 +78,19 @@ if cmp -s "$fixture/first-payload" "$generated/www/index.html"; then
   printf 'deployment payload was reused\n' >&2; exit 1
 fi
 
+# Use the ISP's reported address, skipping addresses still undergoing DAD.
+dc() {
+  [[ $* == 'isp ip -o -6 addr show dev eth0 scope link' ]] || return 1
+  cat <<'ADDRESSES'
+2: eth0    inet6 fe80::dead/64 scope link tentative
+2: eth0    inet6 fe80::bad/64 scope link dadfailed
+2: eth0    inet6 fe80::42:6162:6364/64 scope link
+ADDRESSES
+}
+configure_router_gateway
+grep -q "option ip6gw 'fe80::42:6162:6364'" "$generated/network"
+! grep -q '@GATEWAY6@' "$generated/network"
+
 # A stale deployment must fail early with the endpoint and reset instruction.
 fixture_bad_mac=0
 dc() {

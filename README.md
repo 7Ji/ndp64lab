@@ -42,6 +42,14 @@ networks, and images by the `org.ndp64lab.owner=ndp64lab` label. The dedicated
 `ndp64labbuilder` buildx instance is removed only when its ownership marker is
 present under `.generated`. The generated directory is ignored by Git.
 
+Set `BUILD_MIRROR` to an HTTP(S) mirror base URL when running `./lab up` or
+`./lab reset` to select package mirrors under `/alpine`, `/debian`,
+`/debian-security`, or `/openwrt`, according to each image's existing feeds.
+The host checks repository metadata with curl using HTTP HEAD before changing a feed;
+unavailable feeds retain their upstream URL. When unset, builds use upstream
+repositories. Curl is required on the host when setting `BUILD_MIRROR`.
+Container image pulls use Docker's registry configuration.
+
 ## Topology
 
 The ISP connects OpenWrt, a public website, and a separate DMZ client.
@@ -134,7 +142,8 @@ deployments need `./lab reset`; `./lab test` rejects an old client mix.
 ### Routing Behavior
 
 The WAN and ISP links use the generated addresses shown above. OpenWrt's
-IPv6 default route uses the ISP's WAN link-local address, `fe80::1`. Its
+IPv6 default route uses the actual link-local address read from the ISP's
+customer-facing `eth0` during setup. No extra link-local address is assigned. Its
 `eth1` through `eth8` have `192.168.1.1/24` through `192.168.8.1/24`.
 Clients use `.10` on their LAN; the second LAN1 client uses `192.168.1.11/24`.
 Each client uses its LAN router address as the IPv4 default gateway. OpenWrt

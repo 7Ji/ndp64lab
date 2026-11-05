@@ -113,8 +113,8 @@ func main() {
 	if isp {
 		args = args[1:]
 	}
-	if (!isp && len(args) != 2) || (isp && len(args) != 3) {
-		log.Fatal("usage: lab-ndp PREFIX/64 ISP_ADDRESS | lab-ndp isp PREFIX/64 ISP_ADDRESS ethN")
+	if len(args) != 3 {
+		log.Fatal("usage: lab-ndp PREFIX/64 ISP_ADDRESS ISP_LINK_LOCAL | lab-ndp isp PREFIX/64 ISP_ADDRESS ethN")
 	}
 	var err error
 	prefix, subnet, err = net.ParseCIDR(args[0])
@@ -135,11 +135,15 @@ func main() {
 		learnISPRoutes(upstream, port)
 		return
 	}
+	gateway := net.ParseIP(args[2])
+	if gateway == nil || gateway.To4() != nil || !gateway.IsLinkLocalUnicast() {
+		log.Fatal("expected an IPv6 link-local ISP gateway")
+	}
 
 	if err := os.WriteFile("/proc/sys/net/ipv6/conf/all/forwarding", []byte("1"), 0644); err != nil {
 		log.Fatal(err)
 	}
-	if err := command("-6", "route", "replace", upstream.String()+"/128", "via", "fe80::1", "dev", "eth0"); err != nil {
+	if err := command("-6", "route", "replace", upstream.String()+"/128", "via", gateway.String(), "dev", "eth0"); err != nil {
 		log.Fatal(err)
 	}
 	if err := command("-6", "route", "replace", "unreachable", prefix.String()+"/64"); err != nil {

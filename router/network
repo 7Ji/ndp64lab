@@ -11,7 +11,7 @@ config interface 'wan'
 	option netmask '255.255.255.254'
 	option gateway '@GATEWAY4@'
 	option ip6addr '@ROUTER6@/128'
-	option ip6gw 'fe80::1'
+	option ip6gw '@GATEWAY6@'
 
 config interface 'lan1'
 	option device 'eth1'
