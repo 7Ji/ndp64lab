@@ -1,0 +1,15 @@
+FROM debian:trixie-slim
+ARG LAB_ID
+LABEL org.ndp64lab.owner="$LAB_ID"
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+       systemd systemd-sysv udev dbus network-manager iproute2 iputils-ping curl python3 procps \
+    && rm -rf /var/lib/apt/lists/* \
+    && systemctl mask systemd-resolved.service systemd-firstboot.service \
+    && mkdir -p /etc/systemd/system/systemd-udev-trigger.service.d \
+    && printf '[Service]\nExecStart=\nExecStart=udevadm trigger --action=add --subsystem-match=net\n' \
+       > /etc/systemd/system/systemd-udev-trigger.service.d/lab.conf \
+    && systemctl set-default multi-user.target
+COPY client/entrypoint /usr/sbin/lab-client
+STOPSIGNAL SIGRTMIN+3
+CMD ["/usr/sbin/lab-client"]

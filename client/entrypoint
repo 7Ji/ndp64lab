@@ -1,0 +1,53 @@
+#!/bin/sh
+set -eu
+# Managers own all client addressing. Docker's bootstrap IPv4 is discarded.
+ip -4 addr flush dev eth0
+ip -4 route flush dev eth0
+sysctl -w net.ipv6.conf.all.forwarding=0 net.ipv6.conf.default.forwarding=0 \
+    net.ipv6.conf.eth0.forwarding=0 net.ipv6.conf.eth0.disable_ipv6=0 \
+    net.ipv6.conf.eth0.use_tempaddr=0 >/dev/null
+case "$LAB_CLIENT_KIND" in
+  networkd)
+    mkdir -p /etc/systemd/network
+    cp /lab-client/network /etc/systemd/network/20-lab.network
+    systemctl enable systemd-networkd.service
+    systemctl disable NetworkManager.service
+    exec /sbin/init
+    ;;
+  networkmanager)
+    mkdir -p /etc/NetworkManager/system-connections /etc/NetworkManager/conf.d
+    cat > /etc/NetworkManager/conf.d/20-lab.conf <<'CONF'
+[main]
+no-auto-default=*
+[device-lab]
+match-device=interface-name:eth0
+managed=1
+keep-configuration=0
+CONF
+    cp /lab-client/network /etc/NetworkManager/system-connections/lab.nmconnection
+    chmod 600 /etc/NetworkManager/system-connections/lab.nmconnection
+    mkdir -p /etc/systemd/system/NetworkManager.service.d
+    printf '[Service]\nExecStartPost=/usr/bin/nmcli --wait 60 connection up lab\n' \
+      > /etc/systemd/system/NetworkManager.service.d/lab.conf
+    systemctl enable NetworkManager.service
+    systemctl disable systemd-networkd.service
+    exec /sbin/init
+    ;;
+  alpine)
+    cp /lab-client/network /etc/network/interfaces
+    ifup eth0
+    exec sleep infinity
+    ;;
+  fw3|fw4)
+    cp /lab-client/network /etc/config/network
+    cp /lab-client/firewall /etc/config/firewall
+    if [ "$LAB_CLIENT_KIND" = fw3 ]; then
+      # Instantiate legacy tables in this network namespace before fw3 probes them.
+      mkdir -p /var/run
+      iptables -S >/dev/null
+      ip6tables -S >/dev/null
+    fi
+    exec /sbin/init
+    ;;
+  *) echo "unknown client kind: $LAB_CLIENT_KIND" >&2; exit 1 ;;
+esac

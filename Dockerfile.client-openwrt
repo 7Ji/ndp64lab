@@ -1,0 +1,12 @@
+ARG OPENWRT_IMAGE=openwrt/rootfs:x86-64-25.12.6@sha256:14401c04218c2e0da0448f099710ada2460636a92395f353351cc616cf3f67af
+FROM ${OPENWRT_IMAGE}
+ARG LAB_ID
+LABEL org.ndp64lab.owner="$LAB_ID"
+RUN mkdir -p /var/lock /tmp \
+    && if command -v apk >/dev/null; then apk update && apk add ip-full iputils-ping curl; \
+       else opkg update && opkg install ip-full iputils-ping curl; fi \
+    && /etc/init.d/dnsmasq disable \
+    && /etc/init.d/odhcpd disable \
+    && /etc/init.d/uhttpd disable
+COPY client/entrypoint /usr/sbin/lab-client
+CMD ["/usr/sbin/lab-client"]

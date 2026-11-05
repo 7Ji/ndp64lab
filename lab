@@ -8,6 +8,120 @@ label="org.ndp64lab.owner=$prefix"
 builder=ndp64labbuilder
 router_image=ndp64labrouter:24.10.4
 peer_image=ndp64labpeer:3.20
+debian_image=ndp64labclient:trixie
+alpine_image=ndp64labclient:alpine
+fw3_image=ndp64labclient:21.02.7
+fw4_image=ndp64labclient:25.12.6
+fw3_base=openwrt/rootfs:x86-64-21.02.7@sha256:7fc2353153c65d64a35a5fb4dc21a15bb048d812c19df3d8d4ea97745349ef79
+fw4_base=openwrt/rootfs:x86-64-25.12.6@sha256:14401c04218c2e0da0448f099710ada2460636a92395f353351cc616cf3f67af
+
+# Container suffix, LAN, host octet, and native network manager.
+clients() {
+  local index=0 name lan host
+  local -a kinds=(networkd networkmanager alpine fw3 fw4)
+  for name in client{1..8} client1b; do
+    lan=${name#client}; host=10
+    if [[ $lan == 1b ]]; then lan=1; host=11; fi
+    printf '%s %s %s %s\n' "$name" "$lan" "$host" "${kinds[index % 5]}"
+    index=$((index + 1))
+  done
+}
+client_manifest() {
+  printf 'images %s %s %s %s\n' "$debian_image" "$alpine_image" "$fw3_image" "$fw4_image"
+  clients
+}
+prepare_clients() {
+  local name lan host kind config
+  while read -r name lan host kind; do
+    mkdir -p "$generated/clients/$name"
+    config=$generated/clients/$name/network
+    case $kind in
+      networkd)
+        cat > "$config" <<EOF
+[Match]
+Name=eth0
+[Network]
+Address=192.168.$lan.$host/24
+Gateway=192.168.$lan.1
+DHCP=no
+IPv6AcceptRA=yes
+IPv6PrivacyExtensions=no
+LinkLocalAddressing=ipv6
+[IPv6AcceptRA]
+Token=eui64
+UseDNS=no
+EOF
+        ;;
+      networkmanager)
+        cat > "$config" <<EOF
+[connection]
+id=lab
+type=ethernet
+interface-name=eth0
+autoconnect=true
+[ipv4]
+method=manual
+address1=192.168.$lan.$host/24,192.168.$lan.1
+[ipv6]
+method=auto
+addr-gen-mode=eui64
+ip6-privacy=0
+ignore-auto-dns=true
+EOF
+        ;;
+      alpine)
+        cat > "$config" <<EOF
+auto lo
+iface lo inet loopback
+auto eth0
+iface eth0 inet static
+    address 192.168.$lan.$host/24
+    gateway 192.168.$lan.1
+    pre-up sysctl -w net.ipv6.conf.eth0.accept_ra=1 net.ipv6.conf.eth0.autoconf=1 net.ipv6.conf.eth0.addr_gen_mode=0
+EOF
+        ;;
+      fw3|fw4)
+        cat > "$config" <<EOF
+config interface 'loopback'
+    option device 'lo'
+    option ifname 'lo'
+    option proto 'static'
+    option ipaddr '127.0.0.1'
+    option netmask '255.0.0.0'
+config interface 'lan'
+    option device 'eth0'
+    option ifname 'eth0'
+    option proto 'static'
+    option ipaddr '192.168.$lan.$host'
+    option netmask '255.255.255.0'
+    option gateway '192.168.$lan.1'
+config interface 'lan6'
+    option device '@lan'
+    option ifname '@lan'
+    option proto 'dhcpv6'
+    option reqaddress 'none'
+    option reqprefix 'no'
+    option delegate '0'
+    option peerdns '0'
+EOF
+        cat > "$generated/clients/$name/firewall" <<'EOF'
+config defaults
+    option input 'ACCEPT'
+    option output 'ACCEPT'
+    option forward 'REJECT'
+config zone
+    option name 'lan'
+    list network 'lan'
+    list network 'lan6'
+    option input 'ACCEPT'
+    option output 'ACCEPT'
+    option forward 'REJECT'
+EOF
+        ;;
+    esac
+  done < <(clients)
+  client_manifest > "$generated/client-manifest"
+}
 
 die() { printf 'lab: %s\n' "$*" >&2; exit 1; }
 note() { printf 'lab: %s\n' "$*" >&2; }
@@ -114,6 +228,7 @@ prepare_configuration() {
   [[ $(wc -c < "$generated/www/index.html") == 4096 ]] || die 'payload generation failed'
   printf '.html:text/plain\n' > "$generated/www/httpd.conf"
   address_manifest > "$generated/addresses"
+  prepare_clients
   sed -e "s/@ROUTER4@/$router4/g" -e "s/@GATEWAY4@/$isp_customer4/g" \
       -e "s/@ROUTER6@/$router6/g" "$here/router/network" > "$generated/network"
 }
@@ -151,6 +266,10 @@ build_images() {
   fi
   docker buildx build --builder "$builder" --load --build-arg "LAB_ID=$prefix" -f "$here/Dockerfile.peer" -t "$peer_image" "$here"
   docker buildx build --builder "$builder" --load --build-arg "LAB_ID=$prefix" -f "$here/Dockerfile.router" -t "$router_image" "$here"
+  docker buildx build --builder "$builder" --load --build-arg "LAB_ID=$prefix" -f "$here/Dockerfile.client-debian" -t "$debian_image" "$here"
+  docker buildx build --builder "$builder" --load --build-arg "LAB_ID=$prefix" -f "$here/Dockerfile.client-alpine" -t "$alpine_image" "$here"
+  docker buildx build --builder "$builder" --load --build-arg "LAB_ID=$prefix" --build-arg "OPENWRT_IMAGE=$fw3_base" -f "$here/Dockerfile.client-openwrt" -t "$fw3_image" "$here"
+  docker buildx build --builder "$builder" --load --build-arg "LAB_ID=$prefix" --build-arg "OPENWRT_IMAGE=$fw4_base" -f "$here/Dockerfile.client-openwrt" -t "$fw4_image" "$here"
 }
 create_networks() {
   local segment
@@ -159,6 +278,17 @@ create_networks() {
     docker network inspect "$name" >/dev/null 2>&1 && die "network $name already exists"
     docker network create --internal --driver bridge --label "$label" "$name" >/dev/null
   done
+}
+prepare_firewall3() {
+  # Legacy firewall3 needs host-kernel xtables modules before procd starts it.
+  if [[ ! -d /sys/module/iptable_filter || ! -d /sys/module/ip6table_filter ]]; then
+    [[ -d /lib/modules/$(uname -r) ]] || die 'firewall3 requires host iptable_filter and ip6table_filter modules'
+    printf 'iptable_filter\nip6table_filter\n' > "$generated/firewall3-modules.conf"
+    docker run --rm --privileged --network none --label "$label" \
+      --volume /lib/modules:/lib/modules:ro \
+      --volume "$generated/firewall3-modules.conf:/etc/modules-load.d/lab.conf:ro" \
+      "$debian_image" /lib/systemd/systemd-modules-load
+  fi
 }
 start_peers() {
   docker run -d --privileged --name "$(container isp)" --label "$label" \
@@ -170,14 +300,26 @@ start_peers() {
   docker run -d --privileged --name "$(container website)" --label "$label" \
     --volume "$generated/www:/www:ro" --network "$(endpoint_network public eth0 "$website4")" "$peer_image" \
     httpd -f -p 80 -h /www >/dev/null
-  local n name
-  for n in {1..8}; do
-    name="client$n"
+  start_clients
+}
+start_clients() {
+  local name lan host kind image
+  local -a options
+  while read -r name lan host kind; do
+    options=()
+    case $kind in
+      networkd|networkmanager)
+        image=$debian_image
+        options+=(--cgroupns private --tmpfs /run --tmpfs /run/lock --tmpfs /tmp --env container=docker)
+        ;;
+      alpine) image=$alpine_image ;;
+      fw3) image=$fw3_image ;;
+      fw4) image=$fw4_image ;;
+    esac
     docker run -d --privileged --name "$(container "$name")" --label "$label" \
-      --network "$(endpoint_network "$n" eth0 "192.168.$n.10")" "$peer_image" >/dev/null
-  done
-  docker run -d --privileged --name "$(container client1b)" --label "$label" \
-    --network "$(endpoint_network 1 eth0 192.168.1.11)" "$peer_image" >/dev/null
+      --env "LAB_CLIENT_KIND=$kind" --volume "$generated/clients/$name:/lab-client:ro" \
+      "${options[@]}" --network "$(endpoint_network "$lan" eth0 "192.168.$lan.$host")" "$image" >/dev/null
+  done < <(clients)
 }
 start_router() {
   local n mac
@@ -200,8 +342,7 @@ start_router() {
   wait_for 'OpenWrt firewall' 'dc router nft list table inet fw4'
 }
 configure_peers() {
-  local n name
-  local port
+  local name port
   for port in eth0 eth1 eth2; do
     dc isp ip -4 addr flush dev "$port"
     dc isp sysctl -w "net.ipv6.conf.$port.disable_ipv6=0" >/dev/null
@@ -235,33 +376,23 @@ configure_peers() {
       dc "$name" ip -6 route replace default via "$isp_public6"
     fi
   done
-  for n in {1..8}; do
-    name="client$n"
-    dc "$name" sysctl -w net.ipv6.conf.eth0.disable_ipv6=0 >/dev/null
-    dc "$name" sysctl -w net.ipv6.conf.eth0.use_tempaddr=0 >/dev/null
-    dc "$name" ip -4 addr flush dev eth0
-    dc "$name" ip -4 addr add "192.168.$n.10/24" dev eth0
-    dc "$name" ip -4 route replace default via "192.168.$n.1" dev eth0
-  done
-  dc client1b sysctl -w net.ipv6.conf.eth0.disable_ipv6=0 >/dev/null
-  dc client1b sysctl -w net.ipv6.conf.eth0.use_tempaddr=0 >/dev/null
-  dc client1b ip -4 addr flush dev eth0
-  dc client1b ip -4 addr add 192.168.1.11/24 dev eth0
-  dc client1b ip -4 route replace default via 192.168.1.1 dev eth0
 }
 do_up() {
   load_addresses
   require_tools
   local name
   for name in isp router website dmz client{1..8} client1b; do check_name_free "$(container "$name")"; done
-  check_image_owned_or_free "$router_image"
-  check_image_owned_or_free "$peer_image"
+  for name in "$router_image" "$peer_image" "$debian_image" "$alpine_image" "$fw3_image" "$fw4_image"; do
+    check_image_owned_or_free "$name"
+  done
   prepare_configuration
   build_images
   create_networks
+  prepare_firewall3
   start_peers
   configure_peers
   start_router
+  wait_for 'native client managers' 'check_client_managers'
   note 'lab is up'
 }
 do_purge() {
@@ -278,7 +409,7 @@ do_purge() {
   note 'lab resources removed'
 }
 client_addr() {
-  dc "$1" ip -o -6 addr show dev eth0 scope global | awk -v prefix="$shared6" 'index($4, substr(prefix, 1, length(prefix)-1)) == 1 && /proto kernel_ra/ {split($4,a,"/"); print a[1]; exit}'
+  dc "$1" ip -o -6 addr show dev eth0 scope global | awk -v prefix="$shared6" 'index($4, substr(prefix, 1, length(prefix)-1)) == 1 && !/tentative|dadfailed/ {split($4,a,"/"); print a[1]; exit}'
 }
 assert_contains() { [[ $1 == *"$2"* ]] || die "expected '$2' in: $1"; }
 check_website() {
@@ -322,11 +453,39 @@ check_isp_ns_learning() {
   dc isp ip -6 neigh del "$probe" dev eth2
   note 'ISP ignores ordinary sources and learns route/neighbor from NS'
 }
+check_client_managers() {
+  local name lan host kind
+  while read -r name lan host kind; do
+    [[ $(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$(container "$name")") == *"LAB_CLIENT_KIND=$kind"* ]] || die "$name has wrong client kind; run ./lab reset"
+    case $kind in
+      networkd) dc "$name" systemctl is-active --quiet systemd-networkd || return 1 ;;
+      networkmanager)
+        dc "$name" systemctl is-active --quiet NetworkManager || return 1
+        [[ $(dc "$name" nmcli -g GENERAL.CONNECTION device show eth0) == lab ]] || return 1
+        ;;
+      alpine) dc "$name" ifquery --state eth0 >/dev/null || return 1 ;;
+      fw3)
+        dc "$name" pidof netifd >/dev/null || return 1
+        dc "$name" iptables -S zone_lan_input >/dev/null || return 1
+        dc "$name" ip6tables -S zone_lan_input >/dev/null || return 1
+        dc "$name" fw3 print >/dev/null 2>&1 || return 1
+        ;;
+      fw4)
+        dc "$name" pidof netifd >/dev/null || return 1
+        dc "$name" nft list table inet fw4 >/dev/null || return 1
+        ;;
+    esac
+    [[ $(dc "$name" ip -o -4 addr show dev eth0) == *"inet 192.168.$lan.$host/24"* ]] || return 1
+    note "$name uses $kind"
+  done < <(clients)
+}
 do_test() {
   load_addresses
   require_tools
   owned_container "$(container router)" || die 'lab is not up'
   [[ $(cat "$generated/addresses") == "$(address_manifest)" ]] || die 'README address seeds changed; run ./lab reset'
+  [[ -f $generated/client-manifest && $(cat "$generated/client-manifest") == "$(client_manifest)" ]] || die 'client mix changed; run ./lab reset'
+  check_client_managers || die 'a native client manager or firewall is unavailable'
   check_interface_macs
   local n peer name addr addr1 addr1b peer_mac route neigh proxy_table global_addrs unknown_route
   assert_contains "$(dc isp ip -o -6 addr show dev eth0 scope global)" "$isp_customer6/128"
@@ -423,14 +582,15 @@ do_test() {
   dc router nft add rule inet ndp64labcheck forward iifname eth0 ip6 daddr "$addr1" tcp dport 12345 counter
   # Prove a service is listening before checking the firewall; a closed port
   # or unsupported nc option must not make this test pass.
-  dc client1 sh -c 'mkdir -p /tmp/inbound; printf inbound > /tmp/inbound/index.html; httpd -p 12345 -h /tmp/inbound'
+  dc client1 sh -c 'mkdir -p /tmp/inbound; printf inbound > /tmp/inbound/index.html; python3 -m http.server 12345 --bind :: --directory /tmp/inbound >/tmp/inbound.log 2>&1 & echo $! >/tmp/inbound.pid'
+  wait_for 'inbound test listener' "dc client1 curl --noproxy '*' --fail --silent --max-time 2 'http://[::1]:12345/'"
   [[ $(dc client1 curl --noproxy '*' --fail --silent --max-time 2 'http://[::1]:12345/') == inbound ]] || die 'inbound test listener is unavailable'
   for name in isp dmz; do
     if dc "$name" curl --noproxy '*' --fail --silent --max-time 2 "http://[$addr1]:12345/" >/dev/null 2>&1; then
       die "new inbound TCP from $name unexpectedly connected"
     fi
   done
-  dc client1 sh -c 'kill $(pidof httpd)'
+  dc client1 sh -c 'kill $(cat /tmp/inbound.pid)'
   if dc router nft list chain inet ndp64labcheck forward | grep -Eq 'tcp dport 12345 counter packets [1-9]'; then
     die 'new inbound TCP passed the WAN firewall'
   fi

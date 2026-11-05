@@ -12,7 +12,10 @@ Linux x86_64, Docker Engine and CLI 28 or newer with buildx, Bash, and
 permission to create privileged containers and bridge networks. The router image builds on the
 digest-pinned OpenWrt x86/64 24.10.4 container image and builds a static Go
 helper in a separate stage. It installs `ip-full` from OpenWrt's 24.10.4
-package feed, so the first build needs Internet access. Docker 28 or newer is
+package feed. Client builds also need the Debian, Alpine, and OpenWrt package
+feeds, so the first build needs Internet access. The host kernel must provide the legacy `iptable_filter` and `ip6table_filter`
+modules for firewall3; startup loads them when necessary using the privileged
+Debian image and the host’s `/lib/modules`. Docker 28 or newer is
 required for explicit interface naming with `com.docker.network.endpoint.ifname`.
 
 ## Lifecycle
@@ -100,6 +103,34 @@ The customer and DMZ address pools, `108.97.98.0/24` and
 `2108:97:98::/48`, are routed aggregates, not connected link masks; the links
 use the masks shown in the address table.
 
+### Client mix
+
+Clients repeat this five-slot group in order. Debian boots systemd; Alpine uses
+its default ifupdown-ng networking; the OpenWrt clients boot procd/netifd and
+have only a LAN interface, with no WAN, DHCP server, NAT, or prefix delegation.
+
+| Slot | Client OS | Network manager | Current containers |
+| --- | --- | --- | --- |
+| 1 | Debian Trixie | systemd-networkd | `client1`, `client6` |
+| 2 | Debian Trixie | NetworkManager | `client2`, `client7` |
+| 3 | Alpine 3.20 | ifupdown-ng | `client3`, `client8` |
+| 4 | OpenWrt 21.02.7, firewall3 | netifd / odhcp6c | `client4`, `client1b` |
+| 5 | OpenWrt 25.12.6, firewall4 | netifd / odhcp6c | `client5` |
+
+25.12.6 is the latest stable OpenWrt image available when this mix was added;
+there is no published OpenWrt 26 release. Both OpenWrt client images are pinned
+by digest. Debian uses `debian:trixie-slim` and the Trixie package feeds.
+The ISP, website, and DMZ retain the Alpine peer image. All client managers
+configure the existing static IPv4 fixtures, accept SLAAC and RA default routes,
+and disable temporary IPv6 addresses. Debian explicitly uses EUI-64 addresses.
+OpenWrt's `lan6` is an IPv6 protocol interface on the same LAN Ethernet device;
+it requests neither DHCPv6 addresses nor delegated prefixes. Its LAN firewall
+accepts local traffic while rejecting forwarding.
+
+Generated manager configuration is under `.generated/clients/`. Tests verify
+the assigned manager and OpenWrt firewall in addition to connectivity. Existing
+deployments need `./lab reset`; `./lab test` rejects an old client mix.
+
 ### Routing Behavior
 
 The WAN and ISP links use the generated addresses shown above. OpenWrt's
@@ -164,6 +195,7 @@ also be checked without Docker:
 
 ```sh
 bash tests/address-generation.sh
+bash tests/client-configuration.sh
 go test ndp-helper.go ndp-helper_test.go  # NS encoding and validation
 ```
 
