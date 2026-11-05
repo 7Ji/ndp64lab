@@ -8,10 +8,10 @@ generated IPv4 fixtures. No host interface addresses are read.
 
 ## Requirements
 
-Linux x86_64, Docker Engine and CLI 28 or newer with buildx, Bash, and
+Linux x86_64, Docker Engine and CLI 28 or newer with buildx, Bash, Git, and
 permission to create privileged containers and bridge networks. The router image builds on the
-digest-pinned OpenWrt x86/64 24.10.4 container image and builds a static Go
-helper in a separate stage. It installs `ip-full` from OpenWrt's 24.10.4
+digest-pinned OpenWrt x86/64 24.10.4 container image and installs `ip-full`
+and the ucode socket module from OpenWrt's 24.10.4
 package feed. Client builds also need the Debian, Alpine, and OpenWrt package
 feeds, so the first build needs Internet access. The host kernel must provide the legacy `iptable_filter` and `ip6table_filter`
 modules for firewall3; startup loads them when necessary using the privileged
@@ -79,7 +79,7 @@ With the names above, their addresses are:
 | Customer | OpenWrt WAN | `108.97.98.101/31` | `2108:97:98:100::2/128` |
 | DMZ | ISP | `108.97.98.200/31` | `2108:97:98:200::1/128` |
 | DMZ | DMZ client | `108.97.98.201/31` | `2108:97:98:200::2/64` |
-| LAN1–LAN8 | OpenWrt LAN gateways | `192.168.n.1/24` | Link-local RA gateway on each LAN |
+| LAN1–LAN8 | OpenWrt LAN gateways | `192.168.n.1/24` | `2108:97:98:100::ff:n/64` plus link-local RA gateway |
 | LAN1–LAN8 | Clients | `192.168.n.10/24`; LAN1 also has `192.168.1.11/24` | SLAAC addresses in `2108:97:98:100::/64`, shared with the customer link |
 
 For the LAN rows, `n` is the LAN number, 1 through 8; each LAN has its own
@@ -149,7 +149,7 @@ Clients use `.10` on their LAN; the second LAN1 client uses `192.168.1.11/24`.
 Each client uses its LAN router address as the IPv4 default gateway. OpenWrt
 masquerades outbound IPv4 traffic. All clients receive the generated shared
 customer `/64` as an on-link, autonomous prefix via Router Advertisements
-from the helper. DHCPv6 is disabled on each LAN, and clients do not generate
+from odhcpd. DHCPv6 is disabled on each LAN, and clients do not generate
 temporary IPv6 addresses. The ISP forwards between its three links; the DMZ
 and website use it as their default gateway.
 
@@ -174,14 +174,55 @@ routes; subsequent NDP is answered by OpenWrt's proxy. The ISP learners log to
 container. Existing deployments need `./lab reset` to apply this behavior.
 
 OpenWrt's firewall keeps the normal LAN-to-WAN forwarding, WAN rejection, and
-ICMPv6 forwarding behavior. The in-router helper sends RAs, learns client
-addresses from LAN packets, installs `/128` routes, and proxies NDP for each
-client on WAN and the other seven LANs. It also proxies the ISP's on-link `::1`
-address on every LAN so replies can reach the ISP. The helper does not proxy a
-client address on that client's own LAN, leaving same-LAN traffic on the Docker
-bridge rather than in OpenWrt's forwarding path. A `/128` route sends the ISP's
-`::1` address to WAN; an unreachable route for the shared `/64` rejects unknown
-destinations instead of sending them to the ISP.
+ICMPv6 forwarding behavior. odhcpd sends RAs, learns client `/128` routes
+from confirmed kernel neighbors,
+and handles NDP relay across WAN and all LANs. LAN sections use `ra=server`,
+`ndp=relay`, and route learning; WAN is the relay master with RA and route
+learning disabled. Same-LAN client addresses are never proxied on their own
+LAN, so peer traffic stays on the Docker bridge.
+
+Each LAN has a distinct shared-prefix `::ff:1/64` through `::ff:8/64` address,
+provided to odhcpd through netifd. The image builds the packaged odhcpd
+revision from pinned source with a small
+patch allowing sub-minute PIO caps (upstream clamps these to 60 seconds).
+DHCP lease minimums remain unchanged. PIO lifetimes are capped at 30 seconds
+preferred and 60 seconds valid. RAs repeat every 5–10 seconds with a 30-second
+router lifetime. All nine LAN clients retain their SLAAC addresses through
+continued RAs; the DMZ keeps its static address.
+
+UCI specifies the link-local default gateway, a direct `/128` route to the
+ISP's global address, and an unreachable shared `/64` route with metric 1.
+Unknown shared-prefix destinations are rejected. The router has no Go binary.
+Its procd service runs `router/register.uc`, which discovers participating
+LANs from DHCP UCI and devices from netifd. IPv6 sources and DAD targets are
+candidates for interface-bound kernel probes. Confirmed kernel neighbors and
+the router's own shared-prefix addresses are registered using raw ICMPv6 NS
+sockets, nonlocal binding, the WAN MAC, and kernel-generated checksums.
+Startup reconciles existing neighbors, new addresses register immediately,
+successful sends refresh every five seconds, and failures retry after three.
+Removed addresses stop refreshing; network and DHCP changes reload the service.
+
+The separately built ISP-only `/usr/sbin/isp-ndp-learn` receives and validates
+NS packets. Both subscriber learners are supervised inside the ISP container,
+with prefixes, target addresses, interfaces, and a 15-second timeout in its own
+supervisor configuration. Every source, including router `::2`, follows the
+same registration rule. Only a qualifying NS refreshes the monotonic deadline;
+data, NA, and DAD cannot extend it. A one-second sweep deletes expired routes
+and neighbors. Protocol 99 marks learner-owned routes for restart cleanup.
+Subscriber neighbor timers use 5-second reachability and stale GC intervals,
+with 1-second delay and retransmission intervals. Deadline expiry actually
+deletes registrations; a STALE neighbor alone remains usable. The DMZ uses
+the same short timers. Its native configuration disables automatic link-local
+address generation, retaining the selected static global address. Linux then
+uses that address for unicast NUD gateway NS as well as initial resolution,
+so active traffic can renew the registration naturally.
+
+Native manager configuration is generated on the host and copied into stopped
+containers before boot. Deployment manifests stay on the host for validation;
+only website content is mounted. There is no interface remapping or host-driven
+peer address configuration. Native build revisions are pinned in
+`build/native-sources.lock`; source checkouts are retained under
+`~/Building/ndp64lab-sources`.
 
 ### Expected Traffic
 
@@ -205,7 +246,7 @@ also be checked without Docker:
 ```sh
 bash tests/address-generation.sh
 bash tests/client-configuration.sh
-go test ndp-helper.go ndp-helper_test.go  # NS encoding and validation
+GO111MODULE=off go test ./isp  # NS validation, deadline refresh/expiry and restart cleanup
 ```
 
 After changing a naming seed, run `./lab reset` to deploy the new addresses;
@@ -231,3 +272,9 @@ peer traffic does not enter OpenWrt's forwarding path.
 
 When diagnosing a failed run, `./lab exec router logread` shows
 OpenWrt and helper logs. `./lab purge` also works after a partial `up`.
+
+The acceptance suite also stops only the router registration service while
+odhcpd and native client managers continue. During ongoing client traffic, ISP
+registrations expire naturally while the same valid SLAAC addresses and LAN
+connectivity remain. Restarting registration must restore upstream connectivity
+without restarting client networking. A trap restores the service on failure.

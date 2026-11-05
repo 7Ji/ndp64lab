@@ -1,12 +1,7 @@
-FROM golang:1.23-alpine@sha256:383395b794dffa5b53012a212365d40c8e37109a626ca30d6151c8348d380b5f AS helper
-WORKDIR /src
-COPY ndp-helper.go .
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o /ndp-helper ndp-helper.go
-
 FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
 ARG LAB_ID
 COPY --from=repositories / /
 LABEL org.ndp64lab.owner="$LAB_ID"
-RUN apk add --no-cache iproute2 iputils busybox-extras tcpdump curl
-COPY --from=helper /ndp-helper /usr/sbin/lab-ndp
-CMD ["sleep", "infinity"]
+RUN apk add --no-cache ifupdown-ng iproute2 iputils busybox-extras tcpdump curl
+COPY peer/entrypoint /usr/sbin/lab-peer
+CMD ["/usr/sbin/lab-peer"]

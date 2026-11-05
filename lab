@@ -8,6 +8,7 @@ label="org.ndp64lab.owner=$prefix"
 builder=ndp64labbuilder
 router_image=ndp64labrouter:24.10.4
 peer_image=ndp64labpeer:3.20
+isp_image=ndp64labisp:3.20
 debian_image=ndp64labclient:trixie
 alpine_image=ndp64labclient:alpine
 fw3_image=ndp64labclient:21.02.7
@@ -129,7 +130,6 @@ require_no_args() { (( $# == 0 )) || die "$applet takes no arguments"; }
 container() { printf '%s%s' "$prefix" "$1"; }
 network() { printf '%s%s' "$prefix" "$1"; }
 dc() { docker exec "$(container "$1")" "${@:2}"; }
-router_mac_matches() { [[ $(dc router cat "/sys/class/net/eth$1/address" 2>/dev/null) == "$2" ]]; }
 require_tools() {
   [[ $(uname -sm) == 'Linux x86_64' ]] || die 'requires Linux x86_64'
   command -v docker >/dev/null || die 'missing docker'
@@ -230,7 +230,7 @@ prepare_configuration() {
   address_manifest > "$generated/addresses"
   prepare_clients
   sed -e "s/@ROUTER4@/$router4/g" -e "s/@GATEWAY4@/$isp_customer4/g" \
-      -e "s/@ROUTER6@/$router6/g" "$here/router/network" > "$generated/network"
+      -e "s/@ROUTER6@/$router6/g" -e "s/@SHARED6@/$shared6/g" -e "s/@ISP6@/$isp_customer6/g" "$here/router/network" > "$generated/network"
 }
 owned_container() {
   [[ $(docker inspect -f '{{index .Config.Labels "org.ndp64lab.owner"}}' "$1" 2>/dev/null) == "$prefix" ]]
@@ -286,6 +286,16 @@ build_image() {
     --build-context "repositories=$repositories" "$@" -f "$here/$dockerfile" -t "$image" "$here"
   rm -rf -- "$repositories"
 }
+prepare_native_sources() {
+  local name revision checkout root=${NDP64LAB_SOURCES:-$HOME/Building/ndp64lab-sources}
+  mkdir -p "$root" "$generated/native-sources"
+  while read -r name revision; do
+    checkout=$root/$name
+    if [[ ! -d $checkout/.git ]]; then git clone "https://github.com/openwrt/$name.git" "$checkout"; fi
+    mkdir -p "$generated/native-sources/$name"
+    git -C "$checkout" archive "$revision" | tar -xf - -C "$generated/native-sources/$name"
+  done < "$here/build/native-sources.lock"
+}
 build_images() {
   if [[ -n ${BUILD_MIRROR:-} ]]; then command -v curl >/dev/null || die 'BUILD_MIRROR requires curl on the host'; fi
   mkdir -p "$generated"
@@ -297,8 +307,13 @@ build_images() {
   local alpine_base router_base
   alpine_base=$(awk '$1 == "FROM" {base=$2} END {print base}' "$here/Dockerfile.client-alpine")
   router_base=$(awk '$1 == "FROM" {base=$2} END {print base}' "$here/Dockerfile.router")
+  build_image Dockerfile.isp "$isp_image" "$alpine_base"
   build_image Dockerfile.peer "$peer_image" "$alpine_base"
-  build_image Dockerfile.router "$router_image" "$router_base"
+  prepare_native_sources
+  prepare_build_repositories "$alpine_base" "$generated/native-repositories"
+  build_image Dockerfile.router "$router_image" "$router_base" \
+    --build-context "native-repositories=$generated/native-repositories" \
+    --build-context "native-sources=$generated/native-sources"
   build_image Dockerfile.client-debian "$debian_image" debian:trixie-slim
   build_image Dockerfile.client-alpine "$alpine_image" "$alpine_base"
   build_image Dockerfile.client-openwrt "$fw3_image" "$fw3_base" --build-arg "OPENWRT_IMAGE=$fw3_base"
@@ -323,20 +338,102 @@ prepare_firewall3() {
       "$debian_image" /lib/systemd/systemd-modules-load
   fi
 }
+# Each native configuration is installed before PID 1 starts.
+copy_config() { tar --owner=0 --group=0 --transform="s|.*|${3#/}|" -cf - -C "$(dirname "$2")" "$(basename "$2")" | docker cp - "$(container "$1"):/"; }
+prepare_peer_configs() {
+  local name port ports address gateway
+  for name in isp dmz website; do
+    mkdir -p "$generated/peers/$name"
+    {
+      printf 'auto lo\niface lo inet loopback\n'
+      if [[ $name == isp ]]; then
+        printf '    up ip addr add %s/32 dev lo\n' "$isp_identity4"
+        for port in 0 1 2; do
+          case $port in
+            0) address=$isp_customer4/31; gateway=$isp_customer6/128 ;;
+            1) address=$isp_public4/30; gateway=$isp_public6/64 ;;
+            2) address=$isp_dmz4/31; gateway=$isp_dmz6/128 ;;
+          esac
+          printf 'auto eth%s\niface eth%s inet static\n    address %s\niface eth%s inet6 static\n    address %s\n' "$port" "$port" "$address" "$port" "$gateway"
+        done
+      else
+        if [[ $name == dmz ]]; then address=$dmz4/31; gateway=$isp_dmz4
+        else address=$website4/30; gateway=$isp_public4; fi
+        printf 'auto eth0\niface eth0 inet static\n    address %s\n    gateway %s\n' "$address" "$gateway"
+        if [[ $name == dmz ]]; then address=$dmz6/64; gateway=$isp_dmz6
+        else address=$website6/64; gateway=$isp_public6; fi
+        printf 'iface eth0 inet6 static\n    address %s\n    gateway %s\n' "$address" "$gateway"
+      fi
+    } > "$generated/peers/$name/interfaces"
+    sed -i '/^iface eth[0-9] inet static/a\\    pre-up ip -4 addr flush dev $IFACE' "$generated/peers/$name/interfaces"
+    # Interface sysctls belong to native ifupdown configuration, after Docker
+    # has created the named interfaces.
+    if [[ $name == isp ]]; then ports='eth0 eth2'; else ports=eth0; fi
+    for port in $ports; do
+      sed -i "/^iface $port inet static/a\\    pre-up sysctl -w net.ipv6.conf.$port.disable_ipv6=0" "$generated/peers/$name/interfaces"
+      if [[ $name != website ]]; then
+        sed -i "/^iface $port inet static/a\\    pre-up sysctl -w net.ipv6.neigh.$port.base_reachable_time_ms=5000 net.ipv6.neigh.$port.gc_stale_time=5 net.ipv6.neigh.$port.delay_first_probe_time=1 net.ipv6.neigh.$port.retrans_time_ms=1000" "$generated/peers/$name/interfaces"
+      fi
+    done
+    if [[ $name == dmz ]]; then
+      # Unicast NUD probes have no queued packet source. Without a link-local
+      # address Linux selects this static global address for gateway NS too.
+      sed -i '/^iface eth0 inet static/a\\    pre-up sysctl -w net.ipv6.conf.eth0.addr_gen_mode=1\n    pre-up ip -6 addr flush dev eth0 scope link' "$generated/peers/$name/interfaces"
+    fi
+    if [[ $name == isp ]]; then
+      sed -i '/^iface eth1 inet static/a\\    pre-up sysctl -w net.ipv6.conf.eth1.disable_ipv6=0' "$generated/peers/$name/interfaces"
+    fi
+  done
+  cat > "$generated/peers/isp/supervisord.conf" <<EOF
+[supervisord]
+nodaemon=true
+user=root
+[program:customer]
+command=/usr/sbin/isp-ndp-learn $shared6/64 $isp_customer6 eth0 15
+autorestart=true
+stdout_logfile=/tmp/isp-learning-eth0.log
+stderr_logfile=/tmp/isp-learning-eth0.log
+[program:dmz]
+command=/usr/sbin/isp-ndp-learn $customer6:200::/64 $isp_dmz6 eth2 15
+autorestart=true
+stdout_logfile=/tmp/isp-learning-eth2.log
+stderr_logfile=/tmp/isp-learning-eth2.log
+EOF
+}
 start_peers() {
-  docker run -d --privileged --name "$(container isp)" --label "$label" \
+  prepare_peer_configs
+  local name image
+  local -a options
+  docker create --privileged --name "$(container isp)" --label "$label" \
+    --sysctl net.ipv4.ip_forward=1 --sysctl net.ipv6.conf.all.forwarding=1 \
     --network "$(endpoint_network wan eth0 "$isp_customer4")" \
     --network "$(endpoint_network public eth1 "$isp_public4")" \
-    --network "$(endpoint_network dmz eth2 "$isp_dmz4")" "$peer_image" >/dev/null
-  docker run -d --privileged --name "$(container dmz)" --label "$label" \
-    --network "$(endpoint_network dmz eth0 "$dmz4")" "$peer_image" >/dev/null
-  docker run -d --privileged --name "$(container website)" --label "$label" \
-    --volume "$generated/www:/www:ro" --network "$(endpoint_network public eth0 "$website4")" "$peer_image" \
-    httpd -f -p 80 -h /www >/dev/null
+    --network "$(endpoint_network dmz eth2 "$isp_dmz4")" "$isp_image" >/dev/null
+  copy_config isp "$generated/peers/isp/supervisord.conf" /etc/supervisord.conf
+  for name in dmz website; do
+    options=()
+    if [[ $name == dmz ]]; then
+      options+=(--network "$(endpoint_network dmz eth0 "$dmz4")")
+    else
+      options+=(--volume "$generated/www:/www:ro" --network "$(endpoint_network public eth0 "$website4")")
+    fi
+    docker create --privileged --name "$(container "$name")" --label "$label" "${options[@]}" "$peer_image" >/dev/null
+  done
+  for name in isp dmz website; do
+    copy_config "$name" "$generated/peers/$name/interfaces" /etc/network/interfaces
+  done
+  docker start "$(container isp)" >/dev/null
+  wait_for 'ISP NS learners' '[[ $(dc isp pidof isp-ndp-learn | wc -w) -eq 2 ]]'
+  [[ -z $(dc isp ip -6 route show exact "$router6/128") ]] || die 'ISP has a router route before registration'
+  [[ -z $(dc isp ip -6 neigh show "$router6" dev eth0) ]] || die 'ISP has a router neighbor before registration'
+  [[ $(dc isp ip -6 route show root "$shared6/64" dev eth0 | awk '{print $1}') == "$isp_customer6" ]] || die 'ISP starts with unexpected customer routes'
+  [[ $(dc isp ip -6 route show root "$customer6:200::/64" dev eth2 | awk '{print $1}') == "$isp_dmz6" ]] || die 'ISP starts with unexpected DMZ routes'
+  configure_router_gateway
+  docker start "$(container dmz)" "$(container website)" >/dev/null
   start_clients
 }
 start_clients() {
-  local name lan host kind image
+  local name lan host kind image path
   local -a options
   while read -r name lan host kind; do
     options=()
@@ -344,34 +441,32 @@ start_clients() {
       networkd|networkmanager)
         image=$debian_image
         options+=(--cgroupns private --tmpfs /run --tmpfs /run/lock --tmpfs /tmp --env container=docker)
+        if [[ $kind == networkd ]]; then path=/etc/systemd/network/20-lab.network
+        else path=/etc/NetworkManager/system-connections/lab.nmconnection; chmod 600 "$generated/clients/$name/network"; fi
         ;;
-      alpine) image=$alpine_image ;;
-      fw3) image=$fw3_image ;;
-      fw4) image=$fw4_image ;;
+      alpine) image=$alpine_image; path=/etc/network/interfaces ;;
+      fw3) image=$fw3_image; path=/etc/config/network ;;
+      fw4) image=$fw4_image; path=/etc/config/network ;;
     esac
-    docker run -d --privileged --name "$(container "$name")" --label "$label" \
-      --env "LAB_CLIENT_KIND=$kind" --volume "$generated/clients/$name:/lab-client:ro" \
-      "${options[@]}" --network "$(endpoint_network "$lan" eth0 "192.168.$lan.$host")" "$image" >/dev/null
+    docker create --privileged --name "$(container "$name")" --label "$label" \
+      --env "LAB_CLIENT_KIND=$kind" "${options[@]}" \
+      --network "$(endpoint_network "$lan" eth0 "192.168.$lan.$host")" "$image" >/dev/null
+    copy_config "$name" "$generated/clients/$name/network" "$path"
+    case $kind in fw3|fw4) copy_config "$name" "$generated/clients/$name/firewall" /etc/config/firewall ;; esac
+    docker start "$(container "$name")" >/dev/null
   done < <(clients)
 }
 start_router() {
-  local n mac
+  local n
   local -a networks=(--network "$(endpoint_network wan eth0 "$router4")")
-  : > "$generated/interfaces.tmp"
-  printf '0 %s\n' "$(mac_from_ipv4 "$router4")" >> "$generated/interfaces.tmp"
   for n in {1..8}; do
     networks+=(--network "$(endpoint_network "$n" "eth$n" "192.168.$n.1"),alias=router$n")
-    printf '%s %s\n' "$n" "$(mac_from_ipv4 "192.168.$n.1")" >> "$generated/interfaces.tmp"
   done
-  mv "$generated/interfaces.tmp" "$generated/interfaces"
   docker create --privileged --name "$(container router)" --label "$label" \
-    --volume "$generated:/lab:ro" "${networks[@]}" "$router_image" >/dev/null
+    "${networks[@]}" "$router_image" >/dev/null
+  copy_config router "$generated/network" /etc/config/network
   docker start "$(container router)" >/dev/null
-  for n in {0..8}; do
-    mac=$(awk -v n="$n" '$1 == n {print $2}' "$generated/interfaces")
-    wait_for "router eth$n MAC $mac" "router_mac_matches $n $mac"
-  done
-  wait_for 'OpenWrt helper' 'dc router pidof lab-ndp'
+  wait_for 'OpenWrt registration helper' 'dc router pidof ucode'
   wait_for 'OpenWrt firewall' 'dc router nft list table inet fw4'
 }
 isp_link_local() {
@@ -383,48 +478,12 @@ configure_router_gateway() {
   gateway=$(isp_link_local)
   sed -i "s/@GATEWAY6@/$gateway/g" "$generated/network"
 }
-configure_peers() {
-  local name port
-  for port in eth0 eth1 eth2; do
-    dc isp ip -4 addr flush dev "$port"
-    dc isp sysctl -w "net.ipv6.conf.$port.disable_ipv6=0" >/dev/null
-  done
-  dc isp sysctl -w net.ipv4.ip_forward=1 net.ipv6.conf.all.forwarding=1 >/dev/null
-  dc isp ip -4 addr add "$isp_identity4/32" dev lo
-  dc isp ip -4 addr add "$isp_customer4/31" dev eth0
-  dc isp ip -6 addr add "$isp_customer6/128" dev eth0
-  dc isp ip -4 addr add "$isp_public4/30" dev eth1
-  dc isp ip -6 addr add "$isp_public6/64" dev eth1
-  dc isp ip -4 addr add "$isp_dmz4/31" dev eth2
-  dc isp ip -6 addr add "$isp_dmz6/128" dev eth2
-  configure_router_gateway
-  [[ $(dc isp ip -6 route show root "$shared6/64" dev eth0 | awk '{print $1}') == "$isp_customer6" ]] || die 'ISP starts with unexpected customer routes'
-  [[ $(dc isp ip -6 route show root "$customer6:200::/64" dev eth2 | awk '{print $1}') == "$isp_dmz6" ]] || die 'ISP starts with unexpected DMZ routes'
-  docker exec -d "$(container isp)" sh -c 'exec /usr/sbin/lab-ndp isp "$1" "$2" eth0 >/tmp/isp-learning-eth0.log 2>&1' sh "$shared6/64" "$isp_customer6"
-  docker exec -d "$(container isp)" sh -c 'exec /usr/sbin/lab-ndp isp "$1" "$2" eth2 >/tmp/isp-learning-eth2.log 2>&1' sh "$customer6:200::/64" "$isp_dmz6"
-  wait_for 'ISP NS learners' '[[ $(dc isp pidof lab-ndp | wc -w) -eq 2 ]]'
-  for name in dmz website; do
-    dc "$name" ip -4 addr flush dev eth0
-    dc "$name" sysctl -w net.ipv6.conf.eth0.disable_ipv6=0 >/dev/null
-    if [[ $name == dmz ]]; then
-      dc "$name" ip -4 addr add "$dmz4/31" dev eth0
-      dc "$name" ip -6 addr add "$dmz6/64" dev eth0
-      dc "$name" ip -4 route replace default via "$isp_dmz4"
-      dc "$name" ip -6 route replace default via "$isp_dmz6"
-    else
-      dc "$name" ip -4 addr add "$website4/30" dev eth0
-      dc "$name" ip -6 addr add "$website6/64" dev eth0
-      dc "$name" ip -4 route replace default via "$isp_public4"
-      dc "$name" ip -6 route replace default via "$isp_public6"
-    fi
-  done
-}
 do_up() {
   load_addresses
   require_tools
   local name
   for name in isp router website dmz client{1..8} client1b; do check_name_free "$(container "$name")"; done
-  for name in "$router_image" "$peer_image" "$debian_image" "$alpine_image" "$fw3_image" "$fw4_image"; do
+  for name in "$router_image" "$isp_image" "$peer_image" "$debian_image" "$alpine_image" "$fw3_image" "$fw4_image"; do
     check_image_owned_or_free "$name"
   done
   prepare_configuration
@@ -432,9 +491,10 @@ do_up() {
   create_networks
   prepare_firewall3
   start_peers
-  configure_peers
   start_router
   wait_for 'native client managers' 'check_client_managers'
+  for name in client{1..8} client1b; do wait_for "$name initial SLAAC" "[[ -n \$(client_addr $name) ]]"; done
+  check_lifetimes
   note 'lab is up'
 }
 do_purge() {
@@ -490,9 +550,20 @@ check_isp_ns_learning() {
   wait_for 'DMZ probe NS registration' "dc dmz ping -6 -I $probe -c 1 -W 2 $website6"
   assert_contains "$(dc isp ip -6 route show exact "$probe/128")" "$probe dev eth2"
   assert_contains "$(dc isp ip -6 neigh show "$probe" dev eth2)" "$(mac_from_ipv4 "$dmz4")"
+  # Keep data flowing and force NUD to solicit fresh NAs. Neither extends
+  # the registration deadline. The permanent gateway prevents fresh client NS.
+  dc dmz ip -6 neigh replace "$isp_dmz6" lladdr "$(mac_from_ipv4 "$isp_dmz4")" nud permanent dev eth0
+  dc isp ip -6 neigh change "$probe" dev eth2 nud probe
+  local expiry=$((SECONDS + 18))
+  while (( SECONDS < expiry )); do
+    dc dmz ping -6 -I "$probe" -c 1 -W 1 "$website6" >/dev/null 2>&1 || true
+    dc isp ping -6 -c 1 -W 1 "$probe" >/dev/null 2>&1 || true
+    sleep 1
+  done
+  [[ -z $(dc isp ip -6 route show exact "$probe/128") ]] || die 'ordinary traffic or NA postponed registration expiry'
+  [[ -z $(dc isp ip -6 neigh show "$probe" dev eth2) ]] || die 'expired probe retained its ISP neighbor'
   dc dmz ip -6 addr del "$probe/128" dev eth0
-  dc isp ip -6 route del "$probe/128" dev eth2
-  dc isp ip -6 neigh del "$probe" dev eth2
+  dc dmz ip -6 neigh del "$isp_dmz6" dev eth0
   note 'ISP ignores ordinary sources and learns route/neighbor from NS'
 }
 check_client_managers() {
@@ -521,6 +592,56 @@ check_client_managers() {
     note "$name uses $kind"
   done < <(clients)
 }
+check_lifetimes() {
+  local name output preferred valid
+  for name in client{1..8} client1b; do
+    output=$(dc "$name" ip -6 addr show dev eth0 scope global)
+    [[ $output != *forever* ]] || die "$name has infinite SLAAC lifetimes: $output"
+    preferred=$(awk '/preferred_lft/ {for(i=1;i<=NF;i++) if($i=="preferred_lft") {gsub(/sec/,"",$(i+1));print $(i+1)}}' <<< "$output")
+    valid=$(awk '/valid_lft/ {for(i=1;i<=NF;i++) if($i=="valid_lft") {gsub(/sec/,"",$(i+1));print $(i+1)}}' <<< "$output")
+    [[ $preferred =~ ^[0-9]+$ && $valid =~ ^[0-9]+$ ]] || die "cannot read $name lifetimes"
+    (( preferred <= 30 && valid <= 60 && valid > 0 )) || die "$name lifetimes exceed 30/60: $output"
+  done
+}
+check_registration_expiry() (
+  # A subshell EXIT trap restores registration even when an assertion exits.
+  restore_registration() {
+    dc router /etc/init.d/lab-ndp start >/dev/null 2>&1 || true
+    dc client1 sh -c 'test ! -f /tmp/expiry-ping.pid || kill $(cat /tmp/expiry-ping.pid)' >/dev/null 2>&1 || true
+  }
+  trap restore_registration EXIT
+  local name addr deadline
+  declare -A saved=()
+  for name in client{1..8} client1b; do
+    saved[$name]=$(client_addr "$name")
+    [[ ${saved[$name]} == "${addresses[$name]}" ]] || die "$name changed its address across periodic RAs"
+  done
+  check_lifetimes
+  dc client1 sh -c 'ping -6 "$1" >/tmp/expiry-ping.log 2>&1 & echo $! >/tmp/expiry-ping.pid' sh "$website6"
+  dc router /etc/init.d/lab-ndp stop
+  dc router pidof odhcpd >/dev/null || die 'odhcpd stopped with registration'
+  # Wait through the 15-second deadline and several periodic RAs. Sending data
+  # throughout must not refresh ISP registrations or replace SLAAC addresses.
+  deadline=$((SECONDS + 22))
+  while (( SECONDS < deadline )); do sleep 1; done
+  for name in client{1..8} client1b; do
+    addr=${saved[$name]}
+    [[ $(client_addr "$name") == "$addr" ]] || die "$name lost its SLAAC address during registration outage"
+    [[ -z $(dc isp ip -6 route show exact "$addr/128") ]] || die "$name ISP registration did not expire"
+    [[ -z $(dc isp ip -6 neigh show "$addr" dev eth0) ]] || die "$name ISP neighbor did not expire"
+    if dc "$name" ping -6 -I "$addr" -c 1 -W 1 "$website6" >/dev/null 2>&1; then die "$name retained upstream connectivity without registration"; fi
+  done
+  check_lifetimes
+  dc client1 ping -6 -c 1 -W 2 "${saved[client1b]}" >/dev/null || die 'same-LAN connectivity failed during expiry'
+  dc client1 ping -6 -c 1 -W 2 "${saved[client2]}" >/dev/null || die 'cross-LAN connectivity failed during expiry'
+  dc router /etc/init.d/lab-ndp start
+  for name in client{1..8} client1b; do
+    addr=${saved[$name]}
+    wait_for "$name recovery with the same SLAAC address" "dc $name ping -6 -I $addr -c 1 -W 2 $website6"
+    [[ $(client_addr "$name") == "$addr" ]] || die "$name changed address during recovery"
+  done
+  note 'ISP expiry breaks upstream connectivity while SLAAC and LAN connectivity remain; registration restart recovers the same addresses'
+)
 do_test() {
   load_addresses
   require_tools
@@ -529,6 +650,13 @@ do_test() {
   [[ -f $generated/client-manifest && $(cat "$generated/client-manifest") == "$(client_manifest)" ]] || die 'client mix changed; run ./lab reset'
   check_client_managers || die 'a native client manager or firewall is unavailable'
   check_interface_macs
+  local endpoint device devices
+  for endpoint in isp dmz website; do
+    if [[ $endpoint == isp ]]; then devices='eth0 eth1 eth2'; else devices=eth0; fi
+    for device in $devices; do
+      [[ $(dc "$endpoint" ip -o -4 addr show dev "$device" | wc -l) -eq 1 ]] || die "$endpoint $device retained bootstrap IPv4 addresses; run ./lab reset"
+    done
+  done
   local n peer name addr addr1 addr1b peer_mac route neigh proxy_table global_addrs unknown_route
   assert_contains "$(dc isp ip -o -6 addr show dev eth0 scope global)" "$isp_customer6/128"
   assert_contains "$(dc isp ip -o -6 addr show dev eth2 scope global)" "$isp_dmz6/128"
@@ -546,7 +674,9 @@ do_test() {
   gateway=$(isp_link_local)
   [[ -n $gateway ]] || die 'ISP customer link-local address is missing'
   assert_contains "$(dc router ip -6 route show default)" "via $gateway dev eth0"
-  assert_contains "$(dc router ip -6 route get "$isp_customer6")" "via $gateway dev eth0"
+  assert_contains "$(dc router ip -6 route get "$isp_customer6")" "dev eth0"
+  wait_for 'router source NS registration' "[[ -n \$(dc isp ip -6 route show exact $router6/128) ]]"
+  assert_contains "$(dc isp ip -6 neigh show "$router6" dev eth0)" "$(mac_from_ipv4 "$router4")"
   wait_for 'router ISP on-link connectivity' "dc router ping -6 -c 1 -W 2 $isp_customer6"
   if unknown_route=$(dc router ip -6 route get "${shared6}dead:beef" 2>&1); then
     die "unknown shared-prefix address routes via WAN: $unknown_route"
@@ -570,14 +700,17 @@ do_test() {
     addresses[$name]=$addr
     assert_contains "$(dc "$name" ip -4 route get "$isp_identity4")" "via 192.168.$n.1"
     dc "$name" ping -4 -c 1 -W 2 "$isp_identity4" >/dev/null || die "$name cannot reach WAN over IPv4"
-    wait_for "$name IPv6 WAN connectivity" "dc $name ping -6 -I $addr -c 1 -W 2 ${dmz6}"
+    # Keep the static DMZ endpoint active so its kernel can renew its own
+    # gateway registration before testing unsolicited traffic toward it.
+    wait_for 'DMZ active gateway registration' "dc dmz ping -6 -c 1 -W 2 $website6"
+    wait_for "$name IPv6 WAN connectivity" "dc dmz ping -6 -c 1 -W 2 $website6 && dc $name ping -6 -I $addr -c 1 -W 2 ${dmz6}"
     wait_for "$name ISP on-link connectivity" "dc $name ping -6 -I $addr -c 1 -W 2 ${isp_customer6}"
     wait_for "$name route installation" "dc router ip -6 route get $addr | grep -q 'dev eth$n'"
     assert_contains "$(dc isp ip -6 route show exact "$addr/128")" "$addr dev eth0"
     assert_contains "$(dc isp ip -6 neigh show "$addr" dev eth0)" "$(mac_from_ipv4 "$router4")"
     dc isp ping -6 -c 1 -W 2 "$addr" >/dev/null || die "ISP cannot reach $name"
     assert_contains "$(dc router ip -6 neigh show proxy dev eth0)" "$addr"
-    dc dmz ping -6 -c 1 -W 2 "$addr" >/dev/null || die "DMZ cannot reach $name"
+    wait_for "DMZ can reach $name" "dc dmz ping -6 -c 1 -W 2 $addr"
     check_website "$name"
     note "$name IPv4/IPv6 WAN, DMZ, HTTP content and upstream NDP passed"
   done
@@ -624,7 +757,7 @@ do_test() {
   fi
   assert_contains "$(dc router ip -6 route get "$addr1")" 'dev eth1'
   assert_contains "$(dc router ip -6 route get "${addresses[client2]}")" 'dev eth2'
-  dc client1 ping -6 -I "$addr1" -c 2 -W 2 "$dmz6" >/dev/null || die 'explicit source address failed'
+  wait_for 'explicit client source to DMZ' "dc dmz ping -6 -c 1 -W 2 $website6 && dc client1 ping -6 -I $addr1 -c 2 -W 2 $dmz6"
   dc router nft add rule inet ndp64labcheck forward iifname eth0 ip6 daddr "$addr1" tcp dport 12345 counter
   # Prove a service is listening before checking the firewall; a closed port
   # or unsupported nc option must not make this test pass.
@@ -641,7 +774,9 @@ do_test() {
     die 'new inbound TCP passed the WAN firewall'
   fi
   dc router nft delete table inet ndp64labcheck
+  wait_for 'DMZ final active gateway registration' "dc dmz ping -6 -c 1 -W 2 $website6"
   check_website dmz
+  check_registration_expiry
   note 'all acceptance checks passed'
 }
 

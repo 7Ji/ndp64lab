@@ -1,0 +1,58 @@
+--- a/src/config.c
++++ b/src/config.c
+@@ -422,7 +422,7 @@
+ 	}
+ }
+ 
+-static double parse_leasetime(struct blob_attr *c) {
++static double parse_leasetime(struct blob_attr *c, double minimum) {
+ 	char *val = blobmsg_get_string(c), *endptr = NULL;
+ 	double time = strcmp(val, "infinite") ? strtod(val, &endptr) : UINT32_MAX;
+ 
+@@ -441,8 +441,8 @@
+ 			goto err;
+ 	}
+ 
+-	if (time < 60)
+-		time = 60;
++	if (time < minimum)
++		time = minimum;
+ 
+ 	return time;
+ 
+@@ -531,7 +531,7 @@
+ 	}
+ 
+ 	if ((c = tb[LEASE_ATTR_LEASETIME])) {
+-		double time = parse_leasetime(c);
++		double time = parse_leasetime(c, 60);
+ 		if (time < 0)
+ 			goto err;
+ 
+@@ -1007,7 +1007,7 @@
+ 		iface->no_dynamic_dhcp = !blobmsg_get_bool(c);
+ 
+ 	if ((c = tb[IFACE_ATTR_LEASETIME])) {
+-		double time = parse_leasetime(c);
++		double time = parse_leasetime(c, 60);
+ 
+ 		if (time >= 0)
+ 			iface->dhcp_leasetime = time;
+@@ -1018,7 +1018,7 @@
+ 	}
+ 
+ 	if ((c = tb[IFACE_ATTR_MAX_PREFERRED_LIFETIME])) {
+-		double time = parse_leasetime(c);
++		double time = parse_leasetime(c, 1);
+ 
+ 		if (time >= 0) {
+ 			iface->max_preferred_lifetime = time;
+@@ -1029,7 +1029,7 @@
+ 	}
+ 
+ 	if ((c = tb[IFACE_ATTR_MAX_VALID_LIFETIME])) {
+-		double time = parse_leasetime(c);
++		double time = parse_leasetime(c, 1);
+ 
+ 		if (time >= 0) {
+ 			iface->max_valid_lifetime = time;

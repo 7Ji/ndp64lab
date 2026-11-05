@@ -15,6 +15,9 @@ RUN apt-get -o Acquire::https::CaInfo=/etc/ssl/certs/ca-certificates.crt update 
     && printf '[Service]\nExecStart=\nExecStart=udevadm trigger --action=add --subsystem-match=net\n' \
        > /etc/systemd/system/systemd-udev-trigger.service.d/lab.conf \
     && systemctl set-default multi-user.target
+RUN mkdir -p /etc/NetworkManager/system-connections /etc/NetworkManager/conf.d /etc/systemd/network /etc/systemd/system/NetworkManager.service.d
+COPY client/NetworkManager.conf /etc/NetworkManager/conf.d/20-lab.conf
+COPY client/NetworkManager.service.conf /etc/systemd/system/NetworkManager.service.d/lab.conf
 COPY client/entrypoint /usr/sbin/lab-client
 STOPSIGNAL SIGRTMIN+3
 CMD ["/usr/sbin/lab-client"]

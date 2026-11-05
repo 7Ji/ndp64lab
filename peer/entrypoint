@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+ifup -a
+if [ -f /etc/supervisord.conf ]; then exec supervisord -n -c /etc/supervisord.conf; fi
+if [ -d /www ]; then exec httpd -f -p 80 -h /www; fi
+exec sleep infinity

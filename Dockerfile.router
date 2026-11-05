@@ -1,19 +1,22 @@
-FROM golang:1.23-alpine@sha256:383395b794dffa5b53012a212365d40c8e37109a626ca30d6151c8348d380b5f AS helper
-WORKDIR /src
-COPY ndp-helper.go .
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o /ndp-helper ndp-helper.go
+FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc AS native
+COPY --from=native-repositories / /
+RUN apk add --no-cache build-base cmake json-c-dev linux-headers
+COPY --from=native-sources / /src/
+COPY build/odhcpd-lifetime-caps.patch /tmp/lifetimes.patch
+COPY build/build-odhcpd.sh /build-odhcpd.sh
+RUN sh /build-odhcpd.sh
 
 FROM openwrt/rootfs:x86-64-24.10.4@sha256:1310ccbd24f30b3df6e210a48dbd0fb902445ee80e21ffc8b8e882b94987a411
 ARG LAB_ID
 COPY --from=repositories / /
 LABEL org.ndp64lab.owner="$LAB_ID"
-RUN mkdir -p /var/lock /tmp && opkg update && opkg install ip-full \
+RUN mkdir -p /var/lock /tmp && opkg update && opkg install ip-full ucode-mod-socket \
     && uci -q delete 'firewall.@zone[0].network' \
     && for n in 1 2 3 4 5 6 7 8; do uci add_list "firewall.@zone[0].network=lan$n"; done \
     && uci commit firewall
-COPY --from=helper /ndp-helper /usr/sbin/lab-ndp
+COPY router/register.uc /usr/sbin/lab-register.uc
+COPY --from=native /odhcpd /usr/sbin/odhcpd
 COPY router/dhcp /etc/config/dhcp
 COPY router/lab-ndp.init /etc/init.d/lab-ndp
-COPY router/entrypoint /usr/sbin/lab-entrypoint
-RUN chmod +x /etc/init.d/lab-ndp /usr/sbin/lab-entrypoint && ln -s ../init.d/lab-ndp /etc/rc.d/S95lab-ndp
-CMD ["/usr/sbin/lab-entrypoint"]
+RUN chmod +x /etc/init.d/lab-ndp && ln -s ../init.d/lab-ndp /etc/rc.d/S95lab-ndp
+CMD ["/sbin/init"]
