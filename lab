@@ -365,16 +365,27 @@ up_applet() { require_no_args "$@"; do_up; }
 test_applet() { require_no_args "$@"; do_test; }
 purge_applet() { require_no_args "$@"; do_purge; }
 reset_applet() { require_no_args "$@"; do_purge; do_up; do_test; }
+exec_applet() {
+  (( $# > 0 )) || die 'usage: ./lab exec <container suffix> [command [arguments...]]'
+  local suffix=$1
+  shift
+  if (( $# > 0 )); then
+    dc "$suffix" "$@"
+  else
+    docker exec -it "$(container "$suffix")" /bin/sh
+  fi
+}
 
 # Allow the address generator to be exercised without Docker.
 if [[ ${BASH_SOURCE[0]} != "$0" ]]; then return 0; fi
 
-(( $# > 0 )) || die 'usage: ./lab {up|test|purge|reset}'
+(( $# > 0 )) || die 'usage: ./lab {up|test|purge|reset|exec}'
 applet=$1; shift
 case "$applet" in
   up) up_applet "$@" ;;
   test) test_applet "$@" ;;
   purge) purge_applet "$@" ;;
   reset) reset_applet "$@" ;;
+  exec) exec_applet "$@" ;;
   *) die "unknown applet: $applet" ;;
 esac

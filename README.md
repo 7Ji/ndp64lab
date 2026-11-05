@@ -23,9 +23,15 @@ From the repository root:
 ./lab test     # run acceptance checks against the live lab
 ./lab reset    # purge, rebuild, start, and test
 ./lab purge    # remove only ndp64lab resources and generated files
+./lab exec router          # open an interactive /bin/sh in OpenWrt
+./lab exec isp ip addr     # run a command with its arguments in the ISP
 ```
 
-Each applet takes no extra arguments. `up` reports an existing lab; use `reset`
+`exec` takes a container suffix (`router`, `isp`, `dmz`, `website`,
+`client1` through `client8`, or `client1b`) followed by an optional command
+and its arguments. Without a command, it opens an interactive shell, which
+requires a terminal. Command arguments are passed directly to the container.
+The lifecycle applets take no extra arguments. `up` reports an existing lab; use `reset`
 to start over. The project name is fixed as `ndp64lab`, so moving or renaming
 the checkout does not change Docker resource names. `purge` selects containers,
 networks, and images by the `org.ndp64lab.owner=ndp64lab` label. The dedicated
@@ -136,5 +142,5 @@ direct LAN1 peer routing and MAC resolution. It also checks that unknown address
 shared prefix are unreachable. A temporary nftables counter checks that LAN1
 peer traffic does not enter OpenWrt's forwarding path.
 
-When diagnosing a failed run, `docker exec ndp64labrouter logread` shows
+When diagnosing a failed run, `./lab exec router logread` shows
 OpenWrt and helper logs. `./lab purge` also works after a partial `up`.
