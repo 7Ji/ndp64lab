@@ -43,6 +43,3 @@ config route6 'unknown'
 	option target '@SHARED6@/64'
 	option type 'unreachable'
 	option metric '1'
-
-config registration 'registration'
-	option isp_route 'isp'

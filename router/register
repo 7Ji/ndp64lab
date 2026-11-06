@@ -28,9 +28,9 @@ ns_packet() {
     printf '%b' "$bytes"
 }
 [[ ${BASH_SOURCE[0]} == "$0" ]] || return 0
-route=$(uci -q get network.registration.isp_route) || exit 1
-target=$(uci -q get "network.$route.target"); target=${target%/*}
-logical_wan=$(uci -q get "network.$route.interface")
+target=$(uci -q get network.isp.target) || exit 1
+target=${target%/*}
+logical_wan=$(uci -q get network.isp.interface) || exit 1
 wan=$(ubus call "network.interface.$logical_wan" status | jsonfilter -e '@.l3_device')
 [[ -n $wan ]] || exit 1
 target_hex=$(ipv6_hex "$target") || exit 1
