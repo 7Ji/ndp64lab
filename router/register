@@ -1,0 +1,147 @@
+#!/bin/bash
+# odhcpd owns routes and proxies. This service only observes, probes and sends NS.
+set -u
+ipv6_hex() {
+    local address=${1%%%*} left right word zeros i
+    local -a words=() tail=()
+    [[ $address == *:* && $address != *[^0-9a-fA-F:]* ]] || return 1
+    if [[ $address == *::* ]]; then
+        left=${address%%::*}; right=${address#*::}
+        IFS=: read -r -a words <<< "$left"
+        IFS=: read -r -a tail <<< "$right"
+        zeros=$((8 - ${#words[@]} - ${#tail[@]}))
+        (( zeros > 0 )) || return 1
+        for ((i=0;i<zeros;i++)); do words+=(0); done
+        words+=("${tail[@]}")
+    else IFS=: read -r -a words <<< "$address"; fi
+    (( ${#words[@]} == 8 )) || return 1
+    for word in "${words[@]}"; do
+        [[ ${#word} -le 4 && -n $word ]] || return 1
+        printf '%04x' "$((16#$word))"
+    done
+}
+# Kept as a function so packet tests exercise the bytes used by the daemon.
+ns_packet() {
+    local hex=$1 mac=${2//:/} bytes= i
+    hex=8700000000000000${hex}0101${mac}
+    for ((i=0;i<${#hex};i+=2)); do bytes+="\\x${hex:i:2}"; done
+    printf '%b' "$bytes"
+}
+[[ ${BASH_SOURCE[0]} == "$0" ]] || return 0
+route=$(uci -q get network.registration.isp_route) || exit 1
+target=$(uci -q get "network.$route.target"); target=${target%/*}
+logical_wan=$(uci -q get "network.$route.interface")
+wan=$(ubus call "network.interface.$logical_wan" status | jsonfilter -e '@.l3_device')
+[[ -n $wan ]] || exit 1
+target_hex=$(ipv6_hex "$target") || exit 1
+prefix=${target_hex:0:16}
+group=ff02::1:ff${target_hex:26:2}:${target_hex:28:4}
+mac=$(cat "/sys/class/net/$wan/address")
+shared() { local hex; hex=$(ipv6_hex "$1") && [[ ${hex:0:16} == "$prefix" ]]; }
+# Socat 1.7 (21) applies integer sockopts before bind; 1.8 (25) needs
+# its explicit early binary variant. x86_64 is the supported lab platform.
+if socat -hhh 2>&1 | grep -q 'setsockopt-socket'; then
+    freebind_option=setsockopt-socket=41:78:x01000000
+else
+    freebind_option=setsockopt-int=41:78:1
+fi
+register() {
+    # A regular file guarantees one complete datagram per socat read. A pipe
+    # may deliver printf's binary output in several partial reads.
+    (close_fds; exec socat -u OPEN:"$work/ns" \
+      "IP6-SENDTO:[$group%$wan]:58,bind=[$1],so-bindtodevice=$wan,$freebind_option,setsockopt-int=41:18:255,setsockopt-int=41:16:255")
+}
+close_fds() { local fd; for fd in "${fds[@]}"; do exec {fd}>&-; done; }
+probe() { (close_fds; exec ping -6 -n -I "$2" -c 1 -W 1 "$1") >/dev/null 2>&1 & }
+work=$(mktemp -d /tmp/lab-register.XXXXXX)
+ns_packet "$target_hex" "$mac" > "$work/ns"
+declare -A devices=() fds=() candidate=() seen=() probed=() next=() known_dev=() known_mac=()
+cleanup() {
+    trap - EXIT TERM INT
+    local -a children=()
+    close_fds
+    # A signal can interrupt IFS= read; never rely on inherited word splitting.
+    mapfile -t children < <(jobs -p)
+    (( ${#children[@]} == 0 )) || kill "${children[@]}" 2>/dev/null
+    wait 2>/dev/null
+    rm -rf "$work"
+    exit 0
+}
+trap cleanup EXIT TERM INT
+# Query both UCI role and netifd's actual L3 device; no Ethernet indices here.
+while read -r section; do
+    [[ $(uci -q get "dhcp.$section.ndp") == relay ]] || continue
+    [[ $(uci -q get "dhcp.$section.master") != 1 ]] || continue
+    [[ $(uci -q get "dhcp.$section.ra") == server ]] || continue
+    logical=$(uci -q get "dhcp.$section.interface")
+    dev=$(ubus call "network.interface.$logical" status | jsonfilter -e '@.l3_device')
+    [[ -n $dev && ! -v devices[$dev] ]] || continue
+    devices[$dev]=1
+    mkfifo "$work/$dev"
+    exec {fd}<>"$work/$dev"
+    fds[$dev]=$fd
+    (close_fds; exec tcpdump -l -nn -e -tt -Q in -i "$dev" ip6) >"$work/$dev" 2>"$work/$dev.log" &
+done < <(uci show dhcp | sed -n 's/^dhcp\.\([^.=]*\)=dhcp$/\1/p')
+(( ${#devices[@]} )) || exit 1
+last=-1
+while :; do
+    for dev in "${!devices[@]}"; do
+        while IFS= read -r -t 0.02 -u "${fds[$dev]}" line; do
+            # Incoming Ethernet source identifies moves even during DAD (::).
+            read -r stamp source_mac rest <<< "$line"
+            [[ $source_mac =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]] || continue
+            for addr in "${!known_mac[@]}"; do
+                if [[ ${known_mac[$addr]} == "$source_mac" && ${known_dev[$addr]} != "$dev" ]]; then
+                    ip -6 neigh del "$addr" dev "${known_dev[$addr]}" 2>/dev/null
+                    candidate[$addr]=$dev; seen[$addr]=$SECONDS
+                    unset 'known_mac[$addr]' 'known_dev[$addr]' 'next[$addr]'
+                fi
+            done
+            if [[ $line =~ (IP6\ |length\ [0-9]+:\ )([0-9a-fA-F:]+)(\.[0-9]+)?\ \> ]]; then
+                addr=${BASH_REMATCH[2]}
+                if shared "$addr"; then candidate[$addr]=$dev; seen[$addr]=$SECONDS; fi
+                if [[ $addr == :: && $line =~ who\ has\ ([0-9a-fA-F:]+) ]]; then
+                    addr=${BASH_REMATCH[1]}
+                    if shared "$addr"; then candidate[$addr]=$dev; seen[$addr]=$SECONDS; fi
+                fi
+            fi
+        done
+    done
+    now=$SECONDS
+    (( now != last )) || continue
+    last=$now
+    declare -A active=() confirmed=()
+    while read -r index dev family addr rest; do
+        dev=${dev%:}; addr=${addr%/*}
+        [[ $dev == "$wan" || -v devices[$dev] ]] || continue
+        [[ $rest != *tentative* && $rest != *dadfailed* ]] || continue
+        shared "$addr" && active[$addr]=1
+    done < <(ip -o -6 addr show scope global)
+    for dev in "${!devices[@]}"; do
+        while read -r addr rest; do
+            shared "$addr" || continue
+            [[ $rest == *lladdr* && $rest != *FAILED* && $rest != *INCOMPLETE* ]] || continue
+            read -r _ neighbor_mac _ <<< "$rest"
+            if [[ -v candidate[$addr] && ${candidate[$addr]} != "$dev" ]]; then continue; fi
+            if [[ -v known_dev[$addr] && ${known_dev[$addr]} != "$dev" ]]; then
+                ip -6 neigh del "$addr" dev "${known_dev[$addr]}" 2>/dev/null
+            fi
+            known_dev[$addr]=$dev; known_mac[$addr]=$neighbor_mac
+            active[$addr]=1; confirmed[$addr]=$dev
+            if (( now >= ${probed[$addr]:-0} )); then probe "$addr" "$dev"; probed[$addr]=$((now + 5)); fi
+        done < <(ip -6 neigh show dev "$dev")
+    done
+    for addr in "${!candidate[@]}"; do
+        if (( now - ${seen[$addr]} > 60 )); then unset 'candidate[$addr]' 'seen[$addr]'; continue; fi
+        if [[ ! -v active[$addr] ]] && (( now >= ${probed[$addr]:-0} )); then
+            probe "$addr" "${candidate[$addr]}"; probed[$addr]=$((now + 3))
+        fi
+    done
+    for addr in "${!next[@]}"; do [[ -v active[$addr] ]] || unset 'next[$addr]' 'probed[$addr]'; done
+    for addr in "${!active[@]}"; do
+        if (( now >= ${next[$addr]:-0} )); then
+            if register "$addr"; then next[$addr]=$((now + 5)); else next[$addr]=$((now + 3)); fi
+        fi
+    done
+    unset active confirmed
+ done

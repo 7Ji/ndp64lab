@@ -1,0 +1,11 @@
+#!/bin/sh /etc/rc.common
+# Host modules exist, but legacy tables are instantiated per network namespace.
+# Initialize them before the packaged firewall3 service detects capabilities.
+START=18
+boot() { start; }
+start() {
+    command -v fw3 >/dev/null || return 0
+    for tool in iptables ip6tables; do
+        for table in filter nat mangle raw; do "$tool" -t "$table" -S >/dev/null || return 1; done
+    done
+}

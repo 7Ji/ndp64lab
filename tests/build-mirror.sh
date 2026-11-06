@@ -44,11 +44,11 @@ grep -Fxq 'https://mirror.example/openwrt/releases/25.12.6/packages/x86_64/base/
 new_root openwrt-opkg
 mkdir -p "$root/etc/opkg"
 cat > "$root/etc/opkg/distfeeds.conf" <<'FEEDS'
-src/gz current https://downloads.openwrt.org/releases/24.10.4/targets/x86/64/packages
+src/gz current https://downloads.openwrt.org/releases/23.05.6/targets/x86/64/packages
 src/gz legacy https://downloads.openwrt.org/releases/21.02.7/targets/x86/64/packages
 FEEDS
 configure
-grep -Fxq 'src/gz current https://mirror.example/openwrt/releases/24.10.4/targets/x86/64/packages' "$root/etc/opkg/distfeeds.conf"
+grep -Fxq 'src/gz current https://mirror.example/openwrt/releases/23.05.6/targets/x86/64/packages' "$root/etc/opkg/distfeeds.conf"
 grep -Fxq 'src/gz legacy https://downloads.openwrt.org/releases/21.02.7/targets/x86/64/packages' "$root/etc/opkg/distfeeds.conf"
 new_root debian
 mkdir -p "$root/etc/apt/sources.list.d"

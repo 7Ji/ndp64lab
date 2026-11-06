@@ -8,7 +8,7 @@ ARG LAB_ID
 COPY --from=repositories / /
 LABEL org.ndp64lab.owner="$LAB_ID"
 RUN apk add --no-cache ifupdown-ng iproute2 iputils busybox-extras tcpdump curl
-RUN apk add --no-cache supervisor
+RUN apk add --no-cache supervisor python3
 COPY --from=helper /isp-ndp-learn /usr/sbin/isp-ndp-learn
 COPY peer/entrypoint /usr/sbin/lab-peer
 CMD ["/usr/sbin/lab-peer"]

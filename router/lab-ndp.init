@@ -3,7 +3,8 @@ START=95
 USE_PROCD=1
 start_service() {
  procd_open_instance
- procd_set_param command /usr/bin/ucode /usr/sbin/lab-register.uc
+ procd_set_param command /bin/bash /usr/sbin/lab-register
+ procd_set_param term_timeout 10
  procd_set_param respawn
  procd_set_param stdout 1
  procd_set_param stderr 1

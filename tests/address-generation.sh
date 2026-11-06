@@ -36,17 +36,25 @@ for bad in '' 1.2.3 1.2.3.4.5 256.2.3.4 1.-2.3.4 1.2.3.x 0000.2.3.4; do
   fi
 done
 check_endpoint_macs() {
-  local name interface address mac count=0 first
+  local name interface address mac segment count=0 key
   local -A seen=()
   while read -r name interface address; do
     mac=$(mac_from_ipv4 "$address")
-    [[ ! -v seen[$mac] ]]
-    seen[$mac]=1
-    first=${mac%%:*}
-    (( (16#$first & 3) == 2 )) # Locally administered and unicast.
+    segment=$(endpoint_segment "$name" "$interface")
+    [[ -n $segment ]]
+    key=$segment/$mac
+    [[ ! -v seen[$key] ]]
+    seen[$key]=1
     count=$((count + 1))
   done < <(interface_addresses)
-  [[ $count == 24 && ${#seen[@]} == 24 ]]
+  [[ $count == 26 && ${#seen[@]} == 26 ]]
+  [[ $(endpoint_segment isp eth0) == public ]]
+  [[ $(endpoint_segment isp eth1) == wan25 ]]
+  [[ $(endpoint_segment isp eth2) == wan21 ]]
+  [[ $(endpoint_segment isp eth3) == dmz ]]
+  select_subscriber 21
+  [[ $router4 == "$customer4.151" && $shared6 == "$customer6:150::" && $isp_port == eth2 ]]
+  select_subscriber 25
 }
 check_endpoint_macs
 
@@ -64,12 +72,13 @@ load_addresses
 check_endpoint_macs
 mkdir "$here/router"
 cp "$repo/router/network" "$here/router/network"
+cp "$repo/router/dhcp" "$here/router/dhcp"
 generated=$here/generated
 prepare_configuration
-[[ $(cat "$generated/addresses") == $'shared6=2097:98:99:100::\nisp_customer6=2097:98:99:100::1\nwebsite4=65.66.67.2\nwebsite6=2065:66:67::2' ]]
-grep -q "option ipaddr '97.98.99.101'" "$generated/network"
-grep -q "option gateway '97.98.99.100'" "$generated/network"
-grep -q "option ip6addr '2097:98:99:100::2/128'" "$generated/network"
+[[ $(cat "$generated/addresses") == "$(address_manifest)" ]]
+grep -q "option ipaddr '97.98.99.101'" "$generated/router25/network"
+grep -q "option gateway '97.98.99.100'" "$generated/router25/network"
+grep -q "option ip6addr '2097:98:99:100::2/128'" "$generated/router25/network"
 [[ $(wc -c < "$generated/www/index.html") == 4096 ]]
 LC_ALL=C tr -d ' -~' < "$generated/www/index.html" | cmp -s - /dev/null
 cp "$generated/www/index.html" "$fixture/first-payload"
@@ -80,7 +89,7 @@ fi
 
 # Use the ISP's reported address, skipping addresses still undergoing DAD.
 dc() {
-  [[ $* == 'isp ip -o -6 addr show dev eth0 scope link' ]] || return 1
+  [[ $* == 'isp ip -o -6 addr show dev eth1 scope link' || $* == 'isp ip -o -6 addr show dev eth2 scope link' ]] || return 1
   cat <<'ADDRESSES'
 2: eth0    inet6 fe80::dead/64 scope link tentative
 2: eth0    inet6 fe80::bad/64 scope link dadfailed
@@ -88,8 +97,8 @@ dc() {
 ADDRESSES
 }
 configure_router_gateway
-grep -q "option ip6gw 'fe80::42:6162:6364'" "$generated/network"
-! grep -q '@GATEWAY6@' "$generated/network"
+grep -q "option ip6gw 'fe80::42:6162:6364'" "$generated/router25/network"
+! grep -q '@GATEWAY6@' "$generated/router25/network"
 
 # A stale deployment must fail early with the endpoint and reset instruction.
 fixture_bad_mac=0
@@ -109,7 +118,7 @@ fixture_bad_mac=1
 if (check_interface_macs) > "$fixture/error" 2>&1; then
   printf 'accepted a stale interface MAC\n' >&2; exit 1
 fi
-grep -q 'isp eth0 MAC is .*; expected 02:42:61:62:63:64 .*run ./lab reset' "$fixture/error"
+grep -q 'isp eth0 MAC is .*; expected 02:42:41:42:43:01 .*run ./lab reset' "$fixture/error"
 
 # HTTP success alone must not pass: the complete response must match the file.
 response_fixture=$fixture/response

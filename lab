@@ -6,7 +6,8 @@ generated=$here/.generated
 prefix=ndp64lab
 label="org.ndp64lab.owner=$prefix"
 builder=ndp64labbuilder
-router_image=ndp64labrouter:24.10.4
+router25_image=ndp64labrouter:25.12.6
+router21_image=ndp64labrouter:21.02.7
 peer_image=ndp64labpeer:3.20
 isp_image=ndp64labisp:3.20
 debian_image=ndp64labclient:trixie
@@ -16,21 +17,54 @@ fw4_image=ndp64labclient:25.12.6
 fw3_base=openwrt/rootfs:x86-64-21.02.7@sha256:7fc2353153c65d64a35a5fb4dc21a15bb048d812c19df3d8d4ea97745349ef79
 fw4_base=openwrt/rootfs:x86-64-25.12.6@sha256:14401c04218c2e0da0448f099710ada2460636a92395f353351cc616cf3f67af
 
-# Container suffix, LAN, host octet, and native network manager.
+# Subscriber ID, release, customer address offset, ISP interface.
+subscribers() {
+  printf '%s\n' '25 25.12.6 100 1' '21 21.02.7 150 2'
+}
+select_subscriber() {
+  branch=$1
+  local id release offset port
+  while read -r id release offset port; do
+    [[ $id == "$branch" ]] || continue
+    isp_port=eth$port
+    isp_customer4=$customer4.$offset
+    router4=$customer4.$((offset + 1))
+    shared6=$customer6:$offset::
+    isp_customer6=${shared6}1
+    router6=${shared6}2
+    router_image=ndp64labrouter:$release
+    return
+  done < <(subscribers)
+  die "unknown subscriber: $branch"
+}
+# Container suffix, LAN, host octet, native manager.
 clients() {
-  local index=0 name lan host
-  local -a kinds=(networkd networkmanager alpine fw3 fw4)
-  for name in client{1..8} client1b; do
-    lan=${name#client}; host=10
-    if [[ $lan == 1b ]]; then lan=1; host=11; fi
-    printf '%s %s %s %s\n' "$name" "$lan" "$host" "${kinds[index % 5]}"
-    index=$((index + 1))
-  done
+  local id release offset port
+  while read -r id release offset port; do
+    printf '%s\n' "client$id-networkd 1 10 networkd" "client$id-nm 1 11 networkmanager" \
+      "client$id-alpine 2 10 alpine" "client$id-fw4 3 10 fw4" "client$id-fw3 3 11 fw3"
+  done < <(subscribers)
+}
+branch_clients() { clients | awk -v id="$branch" '$1 ~ "^client" id "-"'; }
+containers() {
+  printf '%s\n' isp website dmz
+  local id release offset port name lan host kind
+  while read -r id release offset port; do printf '%s\n' "router$id" "roaming$id"; done < <(subscribers)
+  while read -r name lan host kind; do printf '%s\n' "$name"; done < <(clients)
+}
+segments() {
+  printf '%s\n' public dmz
+  local id release offset port n
+  while read -r id release offset port; do
+    printf 'wan%s\n' "$id"
+    for n in 1 2 3; do printf '%s-%s\n' "$id" "$n"; done
+  done < <(subscribers)
 }
 client_manifest() {
-  printf 'images %s %s %s %s\n' "$debian_image" "$alpine_image" "$fw3_image" "$fw4_image"
+  printf 'layout two-subscribers-v1\n'
+  subscribers
   clients
-  printf '%s\n' 'roaming 1 dhcp networkd'
+  printf '%s\n' 'roaming25 1 dhcp networkd' 'roaming21 1 dhcp networkd'
 }
 prepare_clients() {
   local name lan host kind config
@@ -122,8 +156,10 @@ EOF
         ;;
     esac
   done < <(clients)
-  mkdir -p "$generated/clients/roaming"
-  cat > "$generated/clients/roaming/network" <<'EOF'
+  local id release offset port
+  while read -r id release offset port; do
+  mkdir -p "$generated/clients/roaming$id"
+  cat > "$generated/clients/roaming$id/network" <<'EOF'
 [Match]
 Name=eth0
 [Network]
@@ -138,6 +174,7 @@ UseDNS=no
 Token=eui64
 UseDNS=no
 EOF
+  done < <(subscribers)
   client_manifest > "$generated/client-manifest"
 }
 
@@ -184,19 +221,15 @@ load_addresses() {
   done
   [[ $customer4 != "$public4" ]] || die 'customer and public seeds must differ'
   isp_identity4=$customer4.1
-  isp_customer4=$customer4.100
-  router4=$customer4.101
   isp_dmz4=$customer4.200
   dmz4=$customer4.201
   isp_public4=$public4.1
   website4=$public4.2
-  shared6=$customer6:100::
-  isp_customer6=${shared6}1
-  router6=${shared6}2
   isp_dmz6=$customer6:200::1
   dmz6=$customer6:200::2
   isp_public6=$public6::1
   website6=$public6::2
+  select_subscriber 25
 }
 # Match Docker's historical IPv4-based MAC formula, using intended lab addresses.
 mac_from_ipv4() {
@@ -212,42 +245,66 @@ mac_from_ipv4() {
 }
 # One row per Ethernet endpoint: container suffix, interface, intended IPv4.
 interface_addresses() {
-  printf '%s\n' "isp eth0 $isp_customer4" "isp eth1 $isp_public4" "isp eth2 $isp_dmz4" \
-    "router eth0 $router4" "website eth0 $website4" "dmz eth0 $dmz4"
-  local n
-  for n in {1..8}; do
-    printf '%s\n' "router eth$n 192.168.$n.1" "client$n eth0 192.168.$n.10"
-  done
-  printf '%s\n' 'client1b eth0 192.168.1.11' 'roaming eth0 192.168.0.12'
+  printf '%s\n' "isp eth0 $isp_public4" "isp eth3 $isp_dmz4" "website eth0 $website4" "dmz eth0 $dmz4"
+  local id release offset port n name lan host kind
+  while read -r id release offset port; do
+    printf '%s\n' "isp eth$port $customer4.$offset" "router$id eth0 $customer4.$((offset + 1))"
+    for n in 1 2 3; do printf '%s\n' "router$id eth$n 192.168.$n.1"; done
+    printf '%s\n' "roaming$id eth0 192.168.0.12"
+  done < <(subscribers)
+  while read -r name lan host kind; do printf '%s\n' "$name eth0 192.168.$lan.$host"; done < <(clients)
 }
+endpoint_segment() {
+  local name=$1 interface=$2
+  case $name in
+    isp) case $interface in eth0) echo public;; eth1) echo wan25;; eth2) echo wan21;; eth3) echo dmz;; esac ;;
+    website) echo public;; dmz) echo dmz;;
+    router*) if [[ $interface == eth0 ]]; then echo wan${name#router}; else echo "${name#router}-${interface#eth}"; fi ;;
+    roaming*) echo "${name#roaming}-1" ;;
+    client*) local n l h k; while read -r n l h k; do [[ $n != "$name" ]] || echo "${name:6:2}-$l"; done < <(clients) ;;
+  esac
+}
+
 endpoint_network() {
   printf 'name=%s,mac-address=%s,driver-opt=com.docker.network.endpoint.ifname=%s' \
     "$(network "$1")" "$(mac_from_ipv4 "$3")" "$2"
 }
 check_interface_macs() {
-  local name interface address expected actual
+  local name interface address expected actual segment key
+  local -A seen=()
   while read -r name interface address; do
     expected=$(mac_from_ipv4 "$address")
+    segment=$(endpoint_segment "$name" "$interface"); key=$segment/$expected
+    [[ -n $segment && ! -v seen[$key] ]] || die "duplicate or unassigned MAC on $segment: $expected"
+    seen[$key]=1
     actual=$(dc "$name" cat "/sys/class/net/$interface/address" 2>/dev/null) || actual=missing
     [[ $actual == "$expected" ]] || die "$name $interface MAC is $actual; expected $expected from $address; run ./lab reset"
   done < <(interface_addresses)
-  note 'all 24 interface MACs match their address seeds'
+  note 'all interface MACs match their address seeds'
 }
 address_manifest() {
-  printf 'shared6=%s\nisp_customer6=%s\nwebsite4=%s\nwebsite6=%s\n' \
-    "$shared6" "$isp_customer6" "$website4" "$website6"
+  printf 'layout=two-subscribers-v1\ncustomer4=%s\ncustomer6=%s\nwebsite4=%s\nwebsite6=%s\n' "$customer4" "$customer6" "$website4" "$website6"
 }
 prepare_configuration() {
   mkdir -p "$generated/www"
-  # No new payload until a new deployment; test/up on an existing lab never rewrites it.
-  # A finite random input avoids SIGPIPE under pipefail. Base64 is printable ASCII.
   head -c 3072 /dev/urandom | base64 | tr -d '\n' > "$generated/www/index.html"
   [[ $(wc -c < "$generated/www/index.html") == 4096 ]] || die 'payload generation failed'
   printf '.html:text/plain\n' > "$generated/www/httpd.conf"
   address_manifest > "$generated/addresses"
   prepare_clients
-  sed -e "s/@ROUTER4@/$router4/g" -e "s/@GATEWAY4@/$isp_customer4/g" \
-      -e "s/@ROUTER6@/$router6/g" -e "s/@SHARED6@/$shared6/g" -e "s/@ISP6@/$isp_customer6/g" "$here/router/network" > "$generated/network"
+  local id release offset port
+  while read -r id release offset port; do
+    select_subscriber "$id"
+    mkdir -p "$generated/router$id"
+    sed -e "s/@ROUTER4@/$router4/g" -e "s/@GATEWAY4@/$isp_customer4/g" \
+      -e "s/@ROUTER6@/$router6/g" -e "s/@SHARED6@/$shared6/g" -e "s/@ISP6@/$isp_customer6/g" "$here/router/network" > "$generated/router$id/network"
+    cp "$here/router/dhcp" "$generated/router$id/dhcp"
+    if [[ $id == 21 ]]; then
+      # odhcpd 21 caps RA lifetimes using DHCP lease/preferred lifetimes.
+      sed -i -e "s/max_preferred_lifetime/preferred_lifetime/" \
+        -e "s/option max_valid_lifetime '300s'/option ra_useleasetime '1'/" "$generated/router$id/dhcp"
+    fi
+  done < <(subscribers)
 }
 owned_container() {
   [[ $(docker inspect -f '{{index .Config.Labels "org.ndp64lab.owner"}}' "$1" 2>/dev/null) == "$prefix" ]]
@@ -311,54 +368,57 @@ build_images() {
     touch "$generated/builder-owned"
     docker buildx create --name "$builder" --driver docker-container >/dev/null
   fi
-  local alpine_base router_base
+  local alpine_base id release offset port base
   alpine_base=$(awk '$1 == "FROM" {base=$2} END {print base}' "$here/Dockerfile.client-alpine")
-  router_base=$(awk '$1 == "FROM" {base=$2} END {print base}' "$here/Dockerfile.router")
   build_image Dockerfile.isp "$isp_image" "$alpine_base"
   build_image Dockerfile.peer "$peer_image" "$alpine_base"
-  build_image Dockerfile.router "$router_image" "$router_base"
   build_image Dockerfile.client-debian "$debian_image" debian:trixie-slim
   build_image Dockerfile.client-alpine "$alpine_image" "$alpine_base"
-  build_image Dockerfile.client-openwrt "$fw3_image" "$fw3_base" --build-arg "OPENWRT_IMAGE=$fw3_base"
-  build_image Dockerfile.client-openwrt "$fw4_image" "$fw4_base" --build-arg "OPENWRT_IMAGE=$fw4_base"
+  while read -r id release offset port; do
+    if [[ $id == 25 ]]; then base=$fw4_base; else base=$fw3_base; fi
+    build_image Dockerfile.router "ndp64labrouter:$release" "$base" --build-arg "OPENWRT_IMAGE=$base" --target router
+    build_image Dockerfile.router "ndp64labclient:$release" "$base" --build-arg "OPENWRT_IMAGE=$base" --target client
+  done < <(subscribers)
 }
+
 create_networks() {
   local segment
-  for segment in wan public dmz {1..8}; do
+  while read -r segment; do
     local name; name=$(network "$segment")
     docker network inspect "$name" >/dev/null 2>&1 && die "network $name already exists"
     docker network create --internal --driver bridge --label "$label" "$name" >/dev/null
-  done
+  done < <(segments)
 }
 prepare_firewall3() {
-  # Legacy firewall3 needs host-kernel xtables modules before procd starts it.
-  if [[ ! -d /sys/module/iptable_filter || ! -d /sys/module/ip6table_filter ]]; then
-    [[ -d /lib/modules/$(uname -r) ]] || die 'firewall3 requires host iptable_filter and ip6table_filter modules'
-    printf 'iptable_filter\nip6table_filter\n' > "$generated/firewall3-modules.conf"
+  local module missing=0
+  local -a modules=(ip_tables ip6_tables iptable_filter ip6table_filter iptable_nat ip6table_nat iptable_mangle ip6table_mangle iptable_raw ip6table_raw xt_TCPMSS xt_MASQUERADE xt_conntrack xt_tcpudp xt_comment xt_multiport xt_limit xt_LOG ipt_REJECT ip6t_REJECT)
+  for module in "${modules[@]}"; do [[ -d /sys/module/$module ]] || missing=1; done
+  if (( missing )); then
+    [[ -d /lib/modules/$(uname -r) ]] || die 'firewall3 requires host xtables modules'
+    printf '%s\n' "${modules[@]}" > "$generated/firewall3-modules.conf"
     docker run --rm --privileged --network none --label "$label" \
       --volume /lib/modules:/lib/modules:ro \
       --volume "$generated/firewall3-modules.conf:/etc/modules-load.d/lab.conf:ro" \
       "$debian_image" /lib/systemd/systemd-modules-load
   fi
 }
+
 # Each native configuration is installed before PID 1 starts.
 copy_config() { tar --owner=0 --group=0 --transform="s|.*|${3#/}|" -cf - -C "$(dirname "$2")" "$(basename "$2")" | docker cp - "$(container "$1"):/"; }
 prepare_peer_configs() {
-  local name port ports address gateway
+  local name port ports address gateway id release offset
   for name in isp dmz website; do
     mkdir -p "$generated/peers/$name"
     {
       printf 'auto lo\niface lo inet loopback\n'
       if [[ $name == isp ]]; then
         printf '    up ip addr add %s/32 dev lo\n' "$isp_identity4"
-        for port in 0 1 2; do
-          case $port in
-            0) address=$isp_customer4/31; gateway=$isp_customer6/128 ;;
-            1) address=$isp_public4/30; gateway=$isp_public6/64 ;;
-            2) address=$isp_dmz4/31; gateway=$isp_dmz6/128 ;;
-          esac
-          printf 'auto eth%s\niface eth%s inet static\n    address %s\niface eth%s inet6 static\n    address %s\n' "$port" "$port" "$address" "$port" "$gateway"
-        done
+        printf 'auto eth0\niface eth0 inet static\n    address %s/30\niface eth0 inet6 static\n    address %s/64\n' "$isp_public4" "$isp_public6"
+        while read -r id release offset port; do
+          printf 'auto eth%s\niface eth%s inet static\n    address %s.%s/31\niface eth%s inet6 static\n    address %s:%s::1/128\n' \
+            "$port" "$port" "$customer4" "$offset" "$port" "$customer6" "$offset"
+        done < <(subscribers)
+        printf 'auto eth3\niface eth3 inet static\n    address %s/31\niface eth3 inet6 static\n    address %s/128\n' "$isp_dmz4" "$isp_dmz6"
       else
         if [[ $name == dmz ]]; then address=$dmz4/31; gateway=$isp_dmz4
         else address=$website4/30; gateway=$isp_public4; fi
@@ -371,7 +431,7 @@ prepare_peer_configs() {
     sed -i '/^iface eth[0-9] inet static/a\\    pre-up ip -4 addr flush dev $IFACE' "$generated/peers/$name/interfaces"
     # Interface sysctls belong to native ifupdown configuration, after Docker
     # has created the named interfaces.
-    if [[ $name == isp ]]; then ports='eth0 eth2'; else ports=eth0; fi
+    if [[ $name == isp ]]; then ports='eth0 eth1 eth2 eth3'; else ports=eth0; fi
     for port in $ports; do
       sed -i "/^iface $port inet static/a\\    pre-up sysctl -w net.ipv6.conf.$port.disable_ipv6=0" "$generated/peers/$name/interfaces"
       if [[ $name != website ]]; then
@@ -383,35 +443,37 @@ prepare_peer_configs() {
       # address Linux selects this static global address for gateway NS too.
       sed -i '/^iface eth0 inet static/a\\    pre-up sysctl -w net.ipv6.conf.eth0.addr_gen_mode=1\n    pre-up ip -6 addr flush dev eth0 scope link' "$generated/peers/$name/interfaces"
     fi
-    if [[ $name == isp ]]; then
-      sed -i '/^iface eth1 inet static/a\\    pre-up sysctl -w net.ipv6.conf.eth1.disable_ipv6=0' "$generated/peers/$name/interfaces"
-    fi
   done
-  cat > "$generated/peers/isp/supervisord.conf" <<EOF
-[supervisord]
-nodaemon=true
-user=root
-[program:customer]
-command=/usr/sbin/isp-ndp-learn $shared6/64 $isp_customer6 eth0 15
+  {
+    printf '[supervisord]\nnodaemon=true\nuser=root\n'
+    while read -r id release offset port; do
+      cat <<EOF
+[program:subscriber$id]
+command=/usr/sbin/isp-ndp-learn $customer6:$offset::/64 $customer6:$offset::1 eth$port 15
 autorestart=true
-stdout_logfile=/tmp/isp-learning-eth0.log
-stderr_logfile=/tmp/isp-learning-eth0.log
-[program:dmz]
-command=/usr/sbin/isp-ndp-learn $customer6:200::/64 $isp_dmz6 eth2 15
-autorestart=true
-stdout_logfile=/tmp/isp-learning-eth2.log
-stderr_logfile=/tmp/isp-learning-eth2.log
+stdout_logfile=/tmp/isp-learning-eth$port.log
+stderr_logfile=/tmp/isp-learning-eth$port.log
 EOF
+    done < <(subscribers)
+    cat <<EOF
+[program:dmz]
+command=/usr/sbin/isp-ndp-learn $customer6:200::/64 $isp_dmz6 eth3 15
+autorestart=true
+stdout_logfile=/tmp/isp-learning-eth3.log
+stderr_logfile=/tmp/isp-learning-eth3.log
+EOF
+  } > "$generated/peers/isp/supervisord.conf"
 }
+
 start_peers() {
   prepare_peer_configs
-  local name image
-  local -a options
+  local name image id release offset port
+  local -a options networks
+  networks=(--network "$(endpoint_network public eth0 "$isp_public4")" --network "$(endpoint_network dmz eth3 "$isp_dmz4")")
+  while read -r id release offset port; do networks+=(--network "$(endpoint_network wan$id eth$port "$customer4.$offset")"); done < <(subscribers)
   docker create --privileged --name "$(container isp)" --label "$label" \
     --sysctl net.ipv4.ip_forward=1 --sysctl net.ipv6.conf.all.forwarding=1 \
-    --network "$(endpoint_network wan eth0 "$isp_customer4")" \
-    --network "$(endpoint_network public eth1 "$isp_public4")" \
-    --network "$(endpoint_network dmz eth2 "$isp_dmz4")" "$isp_image" >/dev/null
+    "${networks[@]}" "$isp_image" >/dev/null
   copy_config isp "$generated/peers/isp/supervisord.conf" /etc/supervisord.conf
   for name in dmz website; do
     options=()
@@ -426,15 +488,11 @@ start_peers() {
     copy_config "$name" "$generated/peers/$name/interfaces" /etc/network/interfaces
   done
   docker start "$(container isp)" >/dev/null
-  wait_for 'ISP NS learners' '[[ $(dc isp pidof isp-ndp-learn | wc -w) -eq 2 ]]'
-  [[ -z $(dc isp ip -6 route show exact "$router6/128") ]] || die 'ISP has a router route before registration'
-  [[ -z $(dc isp ip -6 neigh show "$router6" dev eth0) ]] || die 'ISP has a router neighbor before registration'
-  [[ $(dc isp ip -6 route show root "$shared6/64" dev eth0 | awk '{print $1}') == "$isp_customer6" ]] || die 'ISP starts with unexpected customer routes'
-  [[ $(dc isp ip -6 route show root "$customer6:200::/64" dev eth2 | awk '{print $1}') == "$isp_dmz6" ]] || die 'ISP starts with unexpected DMZ routes'
+  wait_for 'ISP NS learners' '[[ $(dc isp pidof isp-ndp-learn | wc -w) -eq 3 ]]'
   configure_router_gateway
   docker start "$(container dmz)" "$(container website)" >/dev/null
-  start_clients
 }
+
 start_clients() {
   local name lan host kind image path
   local -a options
@@ -453,78 +511,100 @@ start_clients() {
     esac
     docker create --privileged --name "$(container "$name")" --label "$label" \
       --env "LAB_CLIENT_KIND=$kind" "${options[@]}" \
-      --network "$(endpoint_network "$lan" eth0 "192.168.$lan.$host")" "$image" >/dev/null
+      --network "$(endpoint_network "${name:6:2}-$lan" eth0 "192.168.$lan.$host")" "$image" >/dev/null
     copy_config "$name" "$generated/clients/$name/network" "$path"
     case $kind in fw3|fw4) copy_config "$name" "$generated/clients/$name/firewall" /etc/config/firewall ;; esac
     docker start "$(container "$name")" >/dev/null
   done < <(clients)
-  start_roaming
+  local id release offset port
+  while read -r id release offset port; do start_roaming "$id"; done < <(subscribers)
 }
 start_roaming() {
-  docker create --privileged --name "$(container roaming)" --label "$label" \
+  local id=$1
+  docker create --privileged --name "$(container roaming$id)" --label "$label" \
     --cgroupns private --tmpfs /run --tmpfs /run/lock --tmpfs /tmp --env container=docker \
-    --env LAB_CLIENT_KIND=networkd --network "$(endpoint_network 1 eth0 192.168.0.12)" "$debian_image" >/dev/null
-  copy_config roaming "$generated/clients/roaming/network" /etc/systemd/network/20-lab.network
-  docker start "$(container roaming)" >/dev/null
+    --env LAB_CLIENT_KIND=networkd --network "$(endpoint_network "$id-1" eth0 192.168.0.12)" "$debian_image" >/dev/null
+  copy_config "roaming$id" "$generated/clients/roaming$id/network" /etc/systemd/network/20-lab.network
+  docker start "$(container roaming$id)" >/dev/null
 }
-start_router() {
-  local n
-  local -a networks=(--network "$(endpoint_network wan eth0 "$router4")")
-  for n in {1..8}; do
-    networks+=(--network "$(endpoint_network "$n" "eth$n" "192.168.$n.1"),alias=router$n")
-  done
-  docker create --privileged --name "$(container router)" --label "$label" \
-    "${networks[@]}" "$router_image" >/dev/null
-  copy_config router "$generated/network" /etc/config/network
-  docker start "$(container router)" >/dev/null
-  wait_for 'OpenWrt registration helper' 'dc router pidof ucode'
-  wait_for 'OpenWrt firewall' 'dc router nft list table inet fw4'
+start_routers() {
+  local id release offset port n
+  local -a networks
+  while read -r id release offset port; do
+    select_subscriber "$id"
+    networks=(--network "$(endpoint_network wan$id eth0 "$router4")")
+    for n in 1 2 3; do networks+=(--network "$(endpoint_network "$id-$n" "eth$n" "192.168.$n.1")"); done
+    docker create --privileged --name "$(container router$id)" --label "$label" "${networks[@]}" "$router_image" >/dev/null
+    copy_config "router$id" "$generated/router$id/network" /etc/config/network
+    copy_config "router$id" "$generated/router$id/dhcp" /etc/config/dhcp
+    docker start "$(container router$id)" >/dev/null
+    wait_for "OpenWrt $id netifd" "dc router$id pidof netifd"
+    wait_for "OpenWrt $id registration" "dc router$id pgrep -f /usr/sbin/lab-register"
+    if [[ $id == 25 ]]; then wait_for 'firewall4' 'dc router25 nft list table inet fw4'
+    else wait_for 'firewall3' 'dc router21 iptables -S zone_lan_forward'; fi
+  done < <(subscribers)
 }
 isp_link_local() {
-  dc isp ip -o -6 addr show dev eth0 scope link | awk '!/tentative|dadfailed/ {split($4, address, "/"); print address[1]; exit}'
+  dc isp ip -o -6 addr show dev "$isp_port" scope link | awk '!/tentative|dadfailed/ {split($4, address, "/"); print address[1]; exit}'
 }
 configure_router_gateway() {
-  local gateway
-  wait_for 'ISP customer link-local address' '[[ -n $(isp_link_local) ]]'
-  gateway=$(isp_link_local)
-  sed -i "s/@GATEWAY6@/$gateway/g" "$generated/network"
+  local id release offset port gateway
+  while read -r id release offset port; do
+    select_subscriber "$id"
+    wait_for "ISP $id link-local address" '[[ -n $(isp_link_local) ]]'
+    gateway=$(isp_link_local)
+    sed -i "s/@GATEWAY6@/$gateway/g" "$generated/router$id/network"
+  done < <(subscribers)
 }
 do_up() {
   load_addresses
   require_tools
   local name
-  for name in isp router website dmz client{1..8} client1b roaming; do check_name_free "$(container "$name")"; done
-  for name in "$router_image" "$isp_image" "$peer_image" "$debian_image" "$alpine_image" "$fw3_image" "$fw4_image"; do
-    check_image_owned_or_free "$name"
-  done
+  while read -r name; do check_name_free "$(container "$name")"; done < <(containers)
+  for name in "$router25_image" "$router21_image" "$isp_image" "$peer_image" "$debian_image" "$alpine_image" "$fw3_image" "$fw4_image"; do check_image_owned_or_free "$name"; done
   prepare_configuration
   build_images
   create_networks
   prepare_firewall3
   start_peers
-  start_router
+  start_routers
+  start_clients
   wait_for 'native client managers' 'check_client_managers'
-  for name in client{1..8} client1b; do wait_for "$name initial SLAAC" "[[ -n \$(client_addr $name) ]]"; done
-  wait_for 'roaming client DHCPv4 lease' "dc roaming ip -o -4 addr show dev eth0 | grep -q 'inet 192.168.1.'"
-  wait_for 'roaming client SLAAC' '[[ -n $(client_addr roaming) ]]'
-  check_lifetimes
+  while read -r name _; do
+    select_subscriber "${name:6:2}"
+    wait_for "$name initial SLAAC" "[[ -n \$(client_addr $name) ]]"
+  done < <(clients)
+  local id release offset port
+  while read -r id release offset port; do
+    select_subscriber "$id"
+    wait_for "roaming$id DHCPv4" "dc roaming$id ip -o -4 addr show dev eth0 | grep -q 'inet 192.168.1.'"
+    wait_for "roaming$id SLAAC" "[[ -n \$(client_addr roaming$id) ]]"
+  done < <(subscribers)
   note 'lab is up'
 }
+
 do_purge() {
   require_tools
   local resource
   while IFS= read -r resource; do [[ -z $resource ]] || docker rm -f "$resource" >/dev/null; done < <(docker ps -aq --filter "label=$label")
   while IFS= read -r resource; do [[ -z $resource ]] || docker network rm "$resource" >/dev/null; done < <(docker network ls -q --filter "label=$label")
   while IFS= read -r resource; do [[ -z $resource ]] || docker image rm -f "$resource" >/dev/null; done < <(docker image ls -q --filter "label=$label" | sort -u)
-  if [[ -e "$generated/builder-owned" ]]; then
+  local keep_builder=0
+  if [[ -e $generated/builder-owned && ${preserve_build_cache:-0} == 1 ]]; then keep_builder=1; fi
+  if [[ -e "$generated/builder-owned" && $keep_builder == 0 ]]; then
     docker buildx prune --builder "$builder" --all --force >/dev/null 2>&1 || true
     docker buildx rm "$builder" >/dev/null 2>&1 || true
   fi
   [[ ! -e "$generated" ]] || rm -rf -- "$generated"
+  if (( keep_builder )); then mkdir -p "$generated"; touch "$generated/builder-owned"; fi
   note 'lab resources removed'
 }
 client_addr() {
   dc "$1" ip -o -6 addr show dev eth0 scope global | awk -v prefix="$shared6" 'index($4, substr(prefix, 1, length(prefix)-1)) == 1 && !/tentative|dadfailed/ {split($4,a,"/"); print a[1]; exit}'
+}
+proxy_entries() {
+  # ip-full 5.x prints an extra space before proxy; compare fields consistently.
+  dc "$1" ip -6 neigh show proxy "${@:2}" | awk '{$1=$1; print}'
 }
 assert_contains() { [[ $1 == *"$2"* ]] || die "expected '$2' in: $1"; }
 check_website() {
@@ -545,28 +625,33 @@ check_website() {
   done
   rm -f "$response"
 }
-check_isp_ns_learning() {
+check_isp_ns_learning() (
+  cleanup_isp_probe() {
+    dc dmz ip -6 addr del "$customer6:200::1234/128" dev eth0 >/dev/null 2>&1 || true
+    dc dmz ip -6 neigh del "$isp_dmz6" dev eth0 >/dev/null 2>&1 || true
+  }
+  trap cleanup_isp_probe EXIT
   local probe=$customer6:200::1234
   # Clear a previous interrupted check, then force data traffic without NS.
   dc dmz ip -6 addr del "$probe/128" dev eth0 >/dev/null 2>&1 || true
-  dc isp ip -6 route del "$probe/128" dev eth2 >/dev/null 2>&1 || true
-  dc isp ip -6 neigh del "$probe" dev eth2 >/dev/null 2>&1 || true
+  dc isp ip -6 route del "$probe/128" dev eth3 >/dev/null 2>&1 || true
+  dc isp ip -6 neigh del "$probe" dev eth3 >/dev/null 2>&1 || true
   dc dmz ip -6 addr add "$probe/128" dev eth0 nodad
   dc dmz ip -6 neigh replace "$isp_dmz6" lladdr "$(mac_from_ipv4 "$isp_dmz4")" nud permanent dev eth0
   if dc dmz ping -6 -I "$probe" -c 1 -W 1 "$website6" >/dev/null 2>&1; then
     die 'ISP returned traffic to a source that never sent NS'
   fi
   [[ -z $(dc isp ip -6 route show exact "$probe/128") ]] || die 'ISP learned a route from ordinary traffic'
-  [[ -z $(dc isp ip -6 neigh show "$probe" dev eth2) ]] || die 'ISP learned a neighbor from ordinary traffic'
+  [[ -z $(dc isp ip -6 neigh show "$probe" dev eth3) ]] || die 'ISP learned a neighbor from ordinary traffic'
   # Force a real gateway NS using the probe as its source, then check both tables.
   dc dmz ip -6 neigh del "$isp_dmz6" dev eth0
   wait_for 'DMZ probe NS registration' "dc dmz ping -6 -I $probe -c 1 -W 2 $website6"
-  assert_contains "$(dc isp ip -6 route show exact "$probe/128")" "$probe dev eth2"
-  assert_contains "$(dc isp ip -6 neigh show "$probe" dev eth2)" "$(mac_from_ipv4 "$dmz4")"
+  assert_contains "$(dc isp ip -6 route show exact "$probe/128")" "$probe dev eth3"
+  assert_contains "$(dc isp ip -6 neigh show "$probe" dev eth3)" "$(mac_from_ipv4 "$dmz4")"
   # Keep data flowing and force NUD to solicit fresh NAs. Neither extends
   # the registration deadline. The permanent gateway prevents fresh client NS.
   dc dmz ip -6 neigh replace "$isp_dmz6" lladdr "$(mac_from_ipv4 "$isp_dmz4")" nud permanent dev eth0
-  dc isp ip -6 neigh change "$probe" dev eth2 nud probe
+  dc isp ip -6 neigh change "$probe" dev eth3 nud probe
   local expiry=$((SECONDS + 18))
   while (( SECONDS < expiry )); do
     dc dmz ping -6 -I "$probe" -c 1 -W 1 "$website6" >/dev/null 2>&1 || true
@@ -574,11 +659,11 @@ check_isp_ns_learning() {
     sleep 1
   done
   [[ -z $(dc isp ip -6 route show exact "$probe/128") ]] || die 'ordinary traffic or NA postponed registration expiry'
-  [[ -z $(dc isp ip -6 neigh show "$probe" dev eth2) ]] || die 'expired probe retained its ISP neighbor'
+  [[ -z $(dc isp ip -6 neigh show "$probe" dev eth3) ]] || die 'expired probe retained its ISP neighbor'
   dc dmz ip -6 addr del "$probe/128" dev eth0
   dc dmz ip -6 neigh del "$isp_dmz6" dev eth0
   note 'ISP ignores ordinary sources and learns route/neighbor from NS'
-}
+)
 check_client_managers() {
   local name lan host kind
   while read -r name lan host kind; do
@@ -607,38 +692,37 @@ check_client_managers() {
 }
 check_lifetimes() {
   local name output preferred valid
-  for name in client{1..8} client1b roaming; do
+  while read -r name _; do
     output=$(dc "$name" ip -6 addr show dev eth0 scope global)
-    [[ $output != *forever* ]] || die "$name has infinite SLAAC lifetimes: $output"
-    preferred=$(awk '/preferred_lft/ {for(i=1;i<=NF;i++) if($i=="preferred_lft") {gsub(/sec/,"",$(i+1));print $(i+1)}}' <<< "$output")
-    valid=$(awk '/valid_lft/ {for(i=1;i<=NF;i++) if($i=="valid_lft") {gsub(/sec/,"",$(i+1));print $(i+1)}}' <<< "$output")
+    [[ -n $output && $output != *forever* ]] || die "$name has invalid SLAAC lifetimes: $output"
+    read -r valid preferred < <(awk '/valid_lft/ {gsub(/sec/, ""); print $2,$4; exit}' <<< "$output")
     [[ $preferred =~ ^[0-9]+$ && $valid =~ ^[0-9]+$ ]] || die "cannot read $name lifetimes"
-    (( preferred <= 60 && valid <= 60 && valid > 0 )) || die "$name lifetimes exceed 60/60: $output"
-  done
+    (( preferred <= 60 && valid <= 300 && valid > 0 )) || die "$name lifetimes exceed 60/300: $output"
+  done < <(branch_clients; printf 'roaming%s\n' "$branch")
 }
 # Move the existing host veth rather than replacing eth0 or its MAC. Docker's
 # endpoint remains assigned to LAN1; the test restores that bridge on exit.
 move_roaming() {
   local lan=$1 bridge network_id peer_index
-  [[ $lan =~ ^[1-8]$ ]] || die "invalid roaming LAN: $lan"
-  owned_network "$(network "$lan")" || die 'roaming target network is not lab-owned'
-  network_id=$(docker network inspect -f '{{.Id}}' "$(network "$lan")")
-  bridge=$(docker network inspect -f '{{index .Options "com.docker.network.bridge.name"}}' "$(network "$lan")")
+  [[ $lan =~ ^[1-3]$ ]] || die "invalid roaming LAN: $lan"
+  owned_network "$(network "$branch-$lan")" || die 'roaming target network is not lab-owned'
+  network_id=$(docker network inspect -f '{{.Id}}' "$(network "$branch-$lan")")
+  bridge=$(docker network inspect -f '{{index .Options "com.docker.network.bridge.name"}}' "$(network "$branch-$lan")")
   [[ -n $bridge ]] || bridge=br-${network_id:0:12}
-  [[ $(dc roaming cat /sys/class/net/eth0/address) == "$(mac_from_ipv4 192.168.0.12)" ]] || die 'roaming MAC changed'
-  peer_index=$(dc roaming cat /sys/class/net/eth0/iflink)
+  [[ $(dc roaming$branch cat /sys/class/net/eth0/address) == "$(mac_from_ipv4 192.168.0.12)" ]] || die 'roaming MAC changed'
+  peer_index=$(dc roaming$branch cat /sys/class/net/eth0/iflink)
   docker run --rm -i --privileged --network host --label "$label" "$peer_image" \
     sh -s -- "$peer_index" "$bridge" < "$here/tests/move-roaming.sh"
 }
 roaming_step_ready() {
   local lan=$1 address=$2 previous=$3 port=$4
-  [[ $(client_addr roaming) == "$address" ]] || return 1
-  dc roaming ip -o -4 addr show dev eth0 | awk -v net="192.168.$lan." '
+  [[ $(client_addr roaming$branch) == "$address" ]] || return 1
+  dc roaming$branch ip -o -4 addr show dev eth0 | awk -v net="192.168.$lan." '
     $3 == "inet" && index($4, net) == 1 {split($4,a,"/"); split(a[1],o,"."); if (o[4]>=100 && o[4]<=199) good=1}
     END {exit !good}' || return 1
-  [[ $(dc roaming ip -4 route show default) == *"via 192.168.$lan.1 dev eth0"* ]] || return 1
-  [[ $(dc router ip -6 route get "$address") == *"dev eth$lan "* ]] || return 1
-  dc roaming python3 -c '
+  [[ $(dc roaming$branch ip -4 route show default) == *"via 192.168.$lan.1 dev eth0"* ]] || return 1
+  [[ $(dc router$branch ip -6 route get "$address") == *"dev eth$lan "* ]] || return 1
+  dc roaming$branch python3 -c '
 import json,sys
 s=json.load(open("/tmp/roaming-state.json"))
 assert s["status"]=="running" and s["sequence"]>int(sys.argv[1])
@@ -647,8 +731,8 @@ assert s["source"]==sys.argv[2] and s["local_port"]==int(sys.argv[3])
 }
 check_roaming() (
   restore_roaming() {
-    dc roaming touch /tmp/roaming-stop >/dev/null 2>&1 || true
-    for endpoint in roaming isp; do
+    dc roaming$branch touch /tmp/roaming-stop >/dev/null 2>&1 || true
+    for endpoint in roaming$branch isp; do
       dc "$endpoint" sh -c 'test ! -f /tmp/roaming-traffic.pid || kill $(cat /tmp/roaming-traffic.pid)' >/dev/null 2>&1 || true
     done
     move_roaming 1 >/dev/null 2>&1 || true
@@ -656,250 +740,196 @@ check_roaming() (
   trap restore_roaming EXIT
   local name n loop address interface_index port previous state
   move_roaming 1
-  wait_for 'roaming initial SLAAC' '[[ -n $(client_addr roaming) ]]'
-  address=$(client_addr roaming)
-  interface_index=$(dc roaming cat /sys/class/net/eth0/ifindex)
-  dc roaming systemctl is-active --quiet systemd-networkd
-  for n in {1..8}; do
-    [[ $(dc router uci -q get "dhcp.lan$n.dhcpv4") == server ]] || die "DHCPv4 is disabled on LAN$n"
+  wait_for 'roaming initial SLAAC' '[[ -n $(client_addr roaming$branch) ]]'
+  address=$(client_addr roaming$branch)
+  interface_index=$(dc roaming$branch cat /sys/class/net/eth0/ifindex)
+  dc roaming$branch systemctl is-active --quiet systemd-networkd
+  for n in 1 2 3; do
+    [[ $(dc router$branch uci -q get "dhcp.lan$n.dhcpv4") == server ]] || die "DHCPv4 is disabled on LAN$n"
   done
-  for name in isp roaming; do
+  for name in isp roaming$branch; do
     docker exec -i "$(container "$name")" sh -c 'cat > /tmp/roaming-traffic.py' < "$here/tests/roaming-traffic.py"
     dc "$name" sh -c 'rm -f /tmp/roaming-state.json /tmp/roaming-stop'
   done
   dc isp sh -c 'python3 -u /tmp/roaming-traffic.py server "$1" >/tmp/roaming-traffic.log 2>&1 & echo $! >/tmp/roaming-traffic.pid' sh "$isp_customer6"
   wait_for 'roaming TCP listener' "dc isp test -f /tmp/roaming-state.json"
   # Establish once. Neither the traffic program nor the move loop reconnects.
-  wait_for 'roaming initial WAN registration' "dc roaming ping -6 -c 1 -W 2 $isp_customer6"
-  dc roaming sh -c 'python3 -u /tmp/roaming-traffic.py client "$1" --source "$2" >/tmp/roaming-traffic.log 2>&1 & echo $! >/tmp/roaming-traffic.pid' sh "$isp_customer6" "$address"
-  wait_for 'persistent roaming TCP connection' 'dc roaming test -f /tmp/roaming-state.json'
-  port=$(dc roaming python3 -c 'import json; print(json.load(open("/tmp/roaming-state.json"))["local_port"])')
-  for loop in 1 2; do
-    for n in {1..8}; do
-      previous=$(dc roaming python3 -c 'import json; print(json.load(open("/tmp/roaming-state.json"))["sequence"])')
+  wait_for 'roaming initial WAN registration' "dc roaming$branch ping -6 -c 1 -W 2 $isp_customer6"
+  dc roaming$branch sh -c 'python3 -u /tmp/roaming-traffic.py client "$1" --source "$2" >/tmp/roaming-traffic.log 2>&1 & echo $! >/tmp/roaming-traffic.pid' sh "$isp_customer6" "$address"
+  wait_for 'persistent roaming TCP connection' 'dc roaming$branch test -f /tmp/roaming-state.json'
+  port=$(dc roaming$branch python3 -c 'import json; print(json.load(open("/tmp/roaming-state.json"))["local_port"])')
+  for loop in 1; do
+    for n in 2 3 1; do
+      previous=$(dc roaming$branch python3 -c 'import json; print(json.load(open("/tmp/roaming-state.json"))["sequence"])')
       move_roaming "$n"
       wait_for "roaming loop $loop LAN$n DHCPv4 and existing TCP progress" "roaming_step_ready $n $address $previous $port"
-      [[ $(dc roaming cat /sys/class/net/eth0/ifindex) == "$interface_index" ]] || die 'roaming replaced the Ethernet interface'
-      [[ $(dc roaming cat /sys/class/net/eth0/address) == "$(mac_from_ipv4 192.168.0.12)" ]] || die 'roaming changed its MAC'
-      [[ $(dc router ip -6 neigh show proxy dev "eth$n") != *"$address proxy"* ]] || die 'roaming is proxied on its current LAN'
-      assert_contains "$(dc isp ip -6 route show exact "$address/128")" "$address dev eth0"
-      assert_contains "$(dc router cat /tmp/dhcp.leases)" "$(mac_from_ipv4 192.168.0.12) 192.168.$n."
-      check_website roaming
+      [[ $(dc roaming$branch cat /sys/class/net/eth0/ifindex) == "$interface_index" ]] || die 'roaming replaced the Ethernet interface'
+      [[ $(dc roaming$branch cat /sys/class/net/eth0/address) == "$(mac_from_ipv4 192.168.0.12)" ]] || die 'roaming changed its MAC'
+      [[ $(proxy_entries router$branch dev "eth$n") != *"$address proxy"* ]] || die 'roaming is proxied on its current LAN'
+      assert_contains "$(dc isp ip -6 route show exact "$address/128")" "$address dev $isp_port"
+      assert_contains "$(dc router$branch cat /tmp/dhcp.leases)" "$(mac_from_ipv4 192.168.0.12) 192.168.$n."
+      check_website roaming$branch
       # Check direct connectivity with the existing static client on this LAN.
-      dc roaming ping -6 -c 1 -W 2 "$(client_addr "client$n")" >/dev/null || die "roaming cannot reach its LAN$n peer"
+      dc roaming$branch ping -6 -c 1 -W 2 "$(client_addr "$(branch_clients | awk -v lan="$n" '$2==lan {print $1; exit}')")" >/dev/null || die "roaming cannot reach its LAN$n peer"
       note "roaming loop $loop LAN$n: DHCPv4, unchanged MAC/IPv6, existing TCP stream, HTTP and local peer passed"
     done
   done
-  dc roaming touch /tmp/roaming-stop
-  wait_for 'roaming traffic completion' "dc roaming python3 -c 'import json; assert json.load(open(\"/tmp/roaming-state.json\"))[\"status\"]==\"finished\"'"
+  dc roaming$branch touch /tmp/roaming-stop
+  wait_for 'roaming traffic completion' "dc roaming$branch python3 -c 'import json; assert json.load(open(\"/tmp/roaming-state.json\"))[\"status\"]==\"finished\"'"
   dc isp python3 -c 'import json; s=json.load(open("/tmp/roaming-state.json")); assert s["accepted"]==1 and s["source"]=="'"$address"'"'
-  state=$(dc roaming cat /tmp/roaming-state.json)
-  note "two roaming loops retained one IPv6 TCP connection: $state"
+  state=$(dc roaming$branch cat /tmp/roaming-state.json)
+  note "subscriber $branch LAN1 → LAN2 → LAN3 → LAN1 retained one IPv6 TCP connection: $state"
   check_client_managers || die 'a static client changed while roaming'
 )
 check_failed_probe() (
-  local address=${addresses[client5]} attempt
-  cleanup_probe() {
-    dc router ip -6 neigh del "$address" dev eth3 >/dev/null 2>&1 || true
-  }
+  local address=${addresses[client$branch-fw4]} attempt
+  cleanup_probe() { dc "router$branch" ip -6 neigh del "$address" dev eth2 >/dev/null 2>&1 || true; }
   trap cleanup_probe EXIT
-  # Stock odhcpd reconciles relay state after neighbor removal. Exercise
-  # failed probe cleanup and require recovery without restarting services.
-  # The kernel may garbage-collect FAILED entries at any time.
-  for attempt in {1..5}; do
-    dc router ip -6 neigh replace "$address" dev eth3 nud failed
-    dc router ip -6 neigh del "$address" dev eth3 >/dev/null 2>&1 || true
-    wait_for 'client2 to client5 after relay probe cleanup' "dc client2 ping -6 -c 1 -W 2 $address" 10
-    assert_contains "$(dc router ip -6 route show exact "$address/128")" 'dev eth5'
-    assert_contains "$(dc router ip -6 neigh show proxy dev eth2)" "$address"
+  for attempt in 1 2 3; do
+    dc "router$branch" ip -6 neigh replace "$address" dev eth2 nud failed
+    dc "router$branch" ip -6 neigh del "$address" dev eth2 >/dev/null 2>&1 || true
+    wait_for "subscriber $branch failed-probe recovery" "dc client$branch-networkd ping -6 -c 1 -W 2 $address" 10
+    assert_contains "$(dc "router$branch" ip -6 route show exact "$address/128")" 'dev eth3'
+    assert_contains "$(proxy_entries "router$branch" dev eth1)" "$address"
   done
-  note 'relay probe cleanup recovers routes, proxies and client2-to-client5 connectivity'
 )
 check_registration_expiry() (
-  # A subshell EXIT trap restores registration even when an assertion exits.
-  restore_registration() {
-    dc router /etc/init.d/lab-ndp start >/dev/null 2>&1 || true
-    dc client1 sh -c 'test ! -f /tmp/expiry-ping.pid || kill $(cat /tmp/expiry-ping.pid)' >/dev/null 2>&1 || true
-  }
+  local first=client$branch-networkd other address name
+  if [[ $branch == 25 ]]; then other=client21-networkd; else other=client25-networkd; fi
+  restore_registration() { dc "router$branch" /etc/init.d/lab-ndp start >/dev/null 2>&1 || true; }
   trap restore_registration EXIT
-  local name addr deadline
-  declare -A saved=()
-  for name in client{1..8} client1b; do
-    saved[$name]=$(client_addr "$name")
-    [[ ${saved[$name]} == "${addresses[$name]}" ]] || die "$name changed its address across periodic RAs"
-  done
+  dc "router$branch" /etc/init.d/lab-ndp stop
+  wait_for "subscriber $branch registration child cleanup" "! dc router$branch pidof tcpdump && ! dc router$branch pidof bash" 15
+  dc "router$branch" pidof odhcpd >/dev/null || die 'odhcpd stopped with registration'
+  sleep 22
+  while read -r name _; do
+    address=${addresses[$name]}
+    [[ $(client_addr "$name") == "$address" ]] || die "$name changed SLAAC address during outage"
+    [[ -z $(dc isp ip -6 route show exact "$address/128") ]] || die "$name registration did not expire"
+    [[ -z $(dc isp ip -6 neigh show "$address" dev "$isp_port") ]] || die "$name neighbor did not expire"
+    if dc "$name" ping -6 -I "$address" -c 1 -W 1 "$website6" >/dev/null 2>&1; then die "$name retained upstream connectivity"; fi
+  done < <(branch_clients)
+  check_website "$other"
+  dc "$first" ping -6 -c 1 -W 2 "${addresses[client$branch-nm]}" >/dev/null
+  dc "$first" ping -6 -c 1 -W 2 "${addresses[client$branch-alpine]}" >/dev/null
   check_lifetimes
-  dc client1 sh -c 'ping -6 "$1" >/tmp/expiry-ping.log 2>&1 & echo $! >/tmp/expiry-ping.pid' sh "$website6"
-  dc router /etc/init.d/lab-ndp stop
-  dc router pidof odhcpd >/dev/null || die 'odhcpd stopped with registration'
-  # Wait through the 15-second deadline and several periodic RAs. Sending data
-  # throughout must not refresh ISP registrations or replace SLAAC addresses.
-  deadline=$((SECONDS + 22))
-  while (( SECONDS < deadline )); do sleep 1; done
-  for name in client{1..8} client1b; do
-    addr=${saved[$name]}
-    [[ $(client_addr "$name") == "$addr" ]] || die "$name lost its SLAAC address during registration outage"
-    [[ -z $(dc isp ip -6 route show exact "$addr/128") ]] || die "$name ISP registration did not expire"
-    [[ -z $(dc isp ip -6 neigh show "$addr" dev eth0) ]] || die "$name ISP neighbor did not expire"
-    if dc "$name" ping -6 -I "$addr" -c 1 -W 1 "$website6" >/dev/null 2>&1; then die "$name retained upstream connectivity without registration"; fi
-  done
-  check_lifetimes
-  dc client1 ping -6 -c 1 -W 2 "${saved[client1b]}" >/dev/null || die 'same-LAN connectivity failed during expiry'
-  dc client1 ping -6 -c 1 -W 2 "${saved[client2]}" >/dev/null || die 'cross-LAN connectivity failed during expiry'
-  dc router /etc/init.d/lab-ndp start
-  for name in client{1..8} client1b; do
-    addr=${saved[$name]}
-    wait_for "$name recovery with the same SLAAC address" "dc $name ping -6 -I $addr -c 1 -W 2 $website6"
-    [[ $(client_addr "$name") == "$addr" ]] || die "$name changed address during recovery"
-  done
-  note 'ISP expiry breaks upstream connectivity while SLAAC and LAN connectivity remain; registration restart recovers the same addresses'
+  dc "router$branch" /etc/init.d/lab-ndp start
+  while read -r name _; do
+    wait_for "$name registration recovery" "dc $name ping -6 -I ${addresses[$name]} -c 1 -W 2 $website6"
+    [[ $(client_addr "$name") == "${addresses[$name]}" ]] || die "$name changed address during recovery"
+  done < <(branch_clients)
+  note "subscriber $branch expiry/recovery and other subscriber isolation passed"
 )
+check_packets() (
+  cleanup_capture() { dc isp sh -c 'test ! -f /tmp/capture.pid || kill $(cat /tmp/capture.pid)' >/dev/null 2>&1 || true; }
+  trap cleanup_capture EXIT
+  local source capture index=0
+  for source in "$router6" "${addresses[client$branch-networkd]}"; do
+    capture=$generated/ns-$branch-$index.pcap
+    dc isp sh -c 'rm -f /tmp/registration.pcap; tcpdump -U -i "$1" -c 1 -w /tmp/registration.pcap "icmp6 && ip6[40] == 135 && src $2 && dst ff02::1:ff00:1" >/tmp/capture.log 2>&1 & echo $! >/tmp/capture.pid' sh "$isp_port" "$source"
+    wait_for 'registration packet capture' "dc isp sh -c 'test -f /tmp/registration.pcap && ! kill -0 \$(cat /tmp/capture.pid) 2>/dev/null'" 20
+    docker cp "$(container isp):/tmp/registration.pcap" "$capture" >/dev/null
+    python3 "$here/tests/ns-packet.py" "$capture" "$source" "$isp_customer6" "$(mac_from_ipv4 "$router4")"
+    index=$((index + 1))
+  done
+)
+check_direct_peers() {
+  local pair left right address route expected
+  for pair in 'networkd nm' 'fw4 fw3'; do
+    read -r left right <<< "$pair"
+    left=client$branch-$left; right=client$branch-$right
+    address=${addresses[$right]}
+    route=$(dc "$left" ip -6 route get "$address")
+    [[ $route == *'dev eth0'* && $route != *'via '* ]] || die "$left does not route directly to $right"
+    dc "$left" ping -6 -c 2 -W 2 "$address" >/dev/null
+    if [[ $right == *-nm ]]; then expected=$(mac_from_ipv4 192.168.1.11); else expected=$(mac_from_ipv4 192.168.3.11); fi
+    assert_contains "$(dc "$left" ip -6 neigh show "$address" dev eth0)" "$expected"
+  done
+}
+check_inbound() (
+  local name=client$branch-networkd address=${addresses[client$branch-networkd]}
+  cleanup_inbound() { dc "$name" sh -c 'test ! -f /tmp/inbound.pid || kill $(cat /tmp/inbound.pid)' >/dev/null 2>&1 || true; }
+  trap cleanup_inbound EXIT
+  dc "$name" sh -c 'mkdir -p /tmp/inbound; printf inbound > /tmp/inbound/index.html; python3 -m http.server 12345 --bind :: --directory /tmp/inbound >/tmp/inbound.log 2>&1 & echo $! >/tmp/inbound.pid'
+  wait_for 'inbound test listener' "dc $name curl --noproxy '*' --fail --silent --max-time 2 'http://[::1]:12345/'"
+  # A LAN peer must connect before WAN failure counts as firewall protection.
+  [[ $(dc "client$branch-nm" curl --noproxy '*' --fail --silent --max-time 3 "http://[$address]:12345/") == inbound ]] || die 'LAN cannot reach inbound listener'
+  local peer
+  for peer in isp dmz; do
+    if dc "$peer" curl --noproxy '*' --fail --silent --max-time 2 "http://[$address]:12345/" >/dev/null 2>&1; then die "unsolicited TCP from $peer reached $name"; fi
+  done
+)
+check_subscriber() {
+  local router=router$branch name lan host kind addr peer peer_lan unknown n table
+  declare -A addresses=() ipv4=() lans=()
+  assert_contains "$(dc isp ip -o -6 addr show dev "$isp_port" scope global)" "$isp_customer6/128"
+  if unknown=$(dc isp ip -6 route get "${shared6}dead:beef" 2>&1); then die "ISP routes unknown destination: $unknown"; fi
+  assert_contains "$(dc "$router" ip -6 route show default)" "via $(isp_link_local) dev eth0"
+  wait_for "$router registration" "dc $router ping -6 -c 1 -W 2 $isp_customer6"
+  assert_contains "$(dc isp ip -6 neigh show "$router6" dev "$isp_port")" "$(mac_from_ipv4 "$router4")"
+  if unknown=$(dc "$router" ip -6 route get "${shared6}dead:beef" 2>&1); then die "$router routes unknown shared destination"; fi
+  assert_contains "$unknown" unreachable
+  [[ -z $(dc "$router" ip -6 neigh show "${shared6}dead:beef" dev eth0) ]] || die 'unknown destination triggered WAN NDP'
+  for n in 1 2 3; do [[ $(dc "$router" uci -q get dhcp.lan$n.dhcpv6) == disabled ]] || die 'DHCPv6 enabled'; done
+  while read -r name lan host kind; do
+    wait_for "$name SLAAC" "[[ -n \$(client_addr $name) ]]"
+    addr=$(client_addr "$name"); addresses[$name]=$addr; ipv4[$name]=192.168.$lan.$host; lans[$name]=$lan
+    [[ $(dc "$name" ip -o -6 addr show dev eth0 scope global | wc -l) -eq 1 ]] || die "$name has multiple global addresses"
+    dc "$name" ping -4 -c 1 -W 2 "$isp_identity4" >/dev/null
+    wait_for "$name IPv6 WAN" "dc $name ping -6 -I $addr -c 1 -W 2 $website6"
+    wait_for "$name DMZ" "dc dmz ping -6 -c 1 -W 2 $website6 && dc $name ping -6 -I $addr -c 1 -W 2 $dmz6"
+    wait_for "$name learned LAN route" "dc $router ip -6 route get $addr | grep -q 'dev eth$lan'"
+    assert_contains "$(dc isp ip -6 route show exact "$addr/128")" "$addr dev $isp_port"
+    assert_contains "$(dc isp ip -6 neigh show "$addr" dev "$isp_port")" "$(mac_from_ipv4 "$router4")"
+    wait_for "ISP to $name" "dc isp ping -6 -c 1 -W 2 $addr"
+    check_website "$name"
+  done < <(branch_clients)
+  table=$(proxy_entries "$router")
+  while read -r name lan host kind; do
+    addr=${addresses[$name]}
+    for n in 0 1 2 3; do
+      if [[ $n == "$lan" ]]; then [[ $table != *"$addr dev eth$n proxy"* ]] || die 'client proxied on own LAN'
+      else assert_contains "$table" "$addr dev eth$n proxy"; fi
+    done
+    while read -r peer peer_lan _; do
+      [[ $peer != "$name" ]] || continue
+      dc "$name" ping -4 -c 1 -W 2 "${ipv4[$peer]}" >/dev/null
+      wait_for "$name to $peer" "dc $name ping -6 -c 1 -W 2 ${addresses[$peer]}" 10
+    done < <(branch_clients)
+  done < <(branch_clients)
+  check_lifetimes
+  check_packets
+  check_direct_peers
+  check_failed_probe
+  check_inbound
+  check_registration_expiry
+  check_roaming
+  note "subscriber $branch acceptance checks passed"
+}
 do_test() {
   load_addresses
   require_tools
-  owned_container "$(container router)" || die 'lab is not up'
-  [[ $(cat "$generated/addresses") == "$(address_manifest)" ]] || die 'README address seeds changed; run ./lab reset'
-  [[ -f $generated/client-manifest && $(cat "$generated/client-manifest") == "$(client_manifest)" ]] || die 'client mix changed; run ./lab reset'
-  check_client_managers || die 'a native client manager or firewall is unavailable'
+  [[ -f $generated/addresses && $(cat "$generated/addresses") == "$(address_manifest)" ]] || die 'stale deployment or changed address seeds; run ./lab reset'
+  [[ -f $generated/client-manifest && $(cat "$generated/client-manifest") == "$(client_manifest)" ]] || die 'topology changed; run ./lab reset'
+  local name device id release offset port
+  while read -r name; do owned_container "$(container "$name")" || die "missing $name; run ./lab reset"; done < <(containers)
+  check_client_managers || die 'native client manager/firewall unavailable'
   check_interface_macs
-  local endpoint device devices
-  for endpoint in isp dmz website; do
-    if [[ $endpoint == isp ]]; then devices='eth0 eth1 eth2'; else devices=eth0; fi
-    for device in $devices; do
-      [[ $(dc "$endpoint" ip -o -4 addr show dev "$device" | wc -l) -eq 1 ]] || die "$endpoint $device retained bootstrap IPv4 addresses; run ./lab reset"
-    done
-  done
-  local n peer name addr addr1 addr1b peer_mac route neigh proxy_table global_addrs unknown_route
-  assert_contains "$(dc isp ip -o -6 addr show dev eth0 scope global)" "$isp_customer6/128"
-  assert_contains "$(dc isp ip -o -6 addr show dev eth2 scope global)" "$isp_dmz6/128"
-  if unknown_route=$(dc isp ip -6 route get "${shared6}dead:beef" 2>&1); then
-    die "ISP has a route to an unseen customer: $unknown_route; run ./lab reset"
-  fi
-  if unknown_route=$(dc isp ip -6 route get "$customer6:200::dead:beef" 2>&1); then
-    die "ISP has a route to an unseen DMZ client: $unknown_route; run ./lab reset"
-  fi
-  wait_for 'DMZ NS registration and ISP connectivity' "dc dmz ping -6 -c 1 -W 2 $isp_dmz6"
-  assert_contains "$(dc isp ip -6 route show exact "$dmz6/128")" "$dmz6 dev eth2"
-  assert_contains "$(dc isp ip -6 neigh show "$dmz6" dev eth2)" "$(mac_from_ipv4 "$dmz4")"
+  while read -r name device _; do
+    [[ $(dc "$name" ip -o -4 addr show dev "$device" | wc -l) -eq 1 ]] || die "$name $device retained bootstrap addresses"
+  done < <(interface_addresses)
+  wait_for 'DMZ registration' "dc dmz ping -6 -c 1 -W 2 $website6"
+  assert_contains "$(dc isp ip -6 route show exact "$dmz6/128")" "$dmz6 dev eth3"
   check_isp_ns_learning
-  local gateway
-  gateway=$(isp_link_local)
-  [[ -n $gateway ]] || die 'ISP customer link-local address is missing'
-  assert_contains "$(dc router ip -6 route show default)" "via $gateway dev eth0"
-  assert_contains "$(dc router ip -6 route get "$isp_customer6")" "dev eth0"
-  wait_for 'router source NS registration' "[[ -n \$(dc isp ip -6 route show exact $router6/128) ]]"
-  assert_contains "$(dc isp ip -6 neigh show "$router6" dev eth0)" "$(mac_from_ipv4 "$router4")"
-  wait_for 'router ISP on-link connectivity' "dc router ping -6 -c 1 -W 2 $isp_customer6"
-  if unknown_route=$(dc router ip -6 route get "${shared6}dead:beef" 2>&1); then
-    die "unknown shared-prefix address routes via WAN: $unknown_route"
-  fi
-  assert_contains "$unknown_route" 'unreachable'
-  if dc router ping -6 -c 1 -W 1 "${shared6}dead:beef" >/dev/null 2>&1; then
-    die 'router reached an unknown shared-prefix address'
-  fi
-  [[ -z $(dc router ip -6 neigh show "${shared6}dead:beef" dev eth0) ]] || die 'unknown address triggered WAN neighbor discovery'
-  declare -A addresses=() ipv4=() lans=()
-  for name in client{1..8} client1b; do
-    n=${name#client}
-    if [[ $n == 1b ]]; then n=1; ipv4[$name]=192.168.1.11
-    else ipv4[$name]="192.168.$n.10"; fi
-    lans[$name]=$n
-    [[ $(dc router uci -q get "dhcp.lan$n.dhcpv6") == disabled ]] || die "DHCPv6 is enabled on LAN$n"
-    wait_for "$name SLAAC" "[[ -n \$(client_addr $name) ]]"
-    global_addrs=$(dc "$name" ip -o -6 addr show dev eth0 scope global)
-    [[ $(printf '%s\n' "$global_addrs" | wc -l) -eq 1 && $global_addrs != *temporary* ]] || die "$name has unexpected global IPv6 addresses: $global_addrs"
-    addr=$(client_addr "$name")
-    addresses[$name]=$addr
-    assert_contains "$(dc "$name" ip -4 route get "$isp_identity4")" "via 192.168.$n.1"
-    dc "$name" ping -4 -c 1 -W 2 "$isp_identity4" >/dev/null || die "$name cannot reach WAN over IPv4"
-    # Keep the static DMZ endpoint active so its kernel can renew its own
-    # gateway registration before testing unsolicited traffic toward it.
-    wait_for 'DMZ active gateway registration' "dc dmz ping -6 -c 1 -W 2 $website6"
-    wait_for "$name IPv6 WAN connectivity" "dc dmz ping -6 -c 1 -W 2 $website6 && dc $name ping -6 -I $addr -c 1 -W 2 ${dmz6}"
-    wait_for "$name ISP on-link connectivity" "dc $name ping -6 -I $addr -c 1 -W 2 ${isp_customer6}"
-    wait_for "$name route installation" "dc router ip -6 route get $addr | grep -q 'dev eth$n'"
-    assert_contains "$(dc isp ip -6 route show exact "$addr/128")" "$addr dev eth0"
-    assert_contains "$(dc isp ip -6 neigh show "$addr" dev eth0)" "$(mac_from_ipv4 "$router4")"
-    dc isp ping -6 -c 1 -W 2 "$addr" >/dev/null || die "ISP cannot reach $name"
-    assert_contains "$(dc router ip -6 neigh show proxy dev eth0)" "$addr"
-    wait_for "DMZ can reach $name" "dc dmz ping -6 -c 1 -W 2 $addr"
-    check_website "$name"
-    note "$name IPv4/IPv6 WAN, DMZ, HTTP content and upstream NDP passed"
-  done
-  proxy_table=$(dc router ip -6 neigh show proxy)
-  for name in client{1..8} client1b; do
-    n=${lans[$name]}
-    addr=${addresses[$name]}
-    for peer in {0..8}; do
-      if (( peer == n )); then
-        [[ $proxy_table != *"$addr dev eth$peer proxy"* ]] || die "$name is proxied on its own LAN"
-      else
-        assert_contains "$proxy_table" "$addr dev eth$peer proxy"
-      fi
-    done
-    assert_contains "$proxy_table" "${isp_customer6} dev eth$n proxy"
-  done
-  for name in client{1..8} client1b; do
-    for peer in client{1..8} client1b; do
-      [[ ${lans[$name]} == "${lans[$peer]}" ]] && continue
-      dc "$name" ping -4 -c 1 -W 2 "${ipv4[$peer]}" >/dev/null || die "$name cannot reach $peer over IPv4"
-      # Allow kernel NDP and odhcpd reconciliation to finish; a single echo
-      # with a two-second deadline can expire during neighbor resolution.
-      wait_for "$name IPv6 connectivity to $peer" "dc $name ping -6 -c 1 -W 2 ${addresses[$peer]}" 10
-    done
-  done
-  note 'all cross-LAN IPv4 and IPv6 pairs passed'
-  check_failed_probe
-  addr1=${addresses[client1]}
-  addr1b=${addresses[client1b]}
-  dc client1b ping -6 -c 2 -W 2 "$addr1" >/dev/null || die 'LAN1 peers cannot communicate'
-  dc router nft delete table inet ndp64labcheck >/dev/null 2>&1 || true
-  dc router nft add table inet ndp64labcheck
-  dc router nft add chain inet ndp64labcheck forward '{ type filter hook forward priority 10; policy accept; }'
-  dc router nft add rule inet ndp64labcheck forward ip6 saddr "$addr1" ip6 daddr "$addr1b" counter
-  dc router nft add rule inet ndp64labcheck forward ip6 saddr "$addr1b" ip6 daddr "$addr1" counter
-  for name in client1 client1b; do
-    if [[ $name == client1 ]]; then addr=$addr1b; peer_mac=$(mac_from_ipv4 192.168.1.11); else addr=$addr1; peer_mac=$(mac_from_ipv4 192.168.1.10); fi
-    route=$(dc "$name" ip -6 route get "$addr")
-    assert_contains "$route" 'dev eth0'
-    [[ $route != *'via '* ]] || die "$name routes its LAN1 peer through a gateway"
-    dc "$name" ping -6 -c 1 -W 2 "$addr" >/dev/null
-    neigh=$(dc "$name" ip -6 neigh show "$addr" dev eth0)
-    assert_contains "$neigh" "$peer_mac"
-  done
-  if dc router nft list chain inet ndp64labcheck forward | grep -Eq 'counter packets [1-9]'; then
-    die 'LAN1 peer traffic entered the router forwarding path'
-  fi
-  assert_contains "$(dc router ip -6 route get "$addr1")" 'dev eth1'
-  assert_contains "$(dc router ip -6 route get "${addresses[client2]}")" 'dev eth2'
-  wait_for 'explicit client source to DMZ' "dc dmz ping -6 -c 1 -W 2 $website6 && dc client1 ping -6 -I $addr1 -c 2 -W 2 $dmz6"
-  dc router nft add rule inet ndp64labcheck forward iifname eth0 ip6 daddr "$addr1" tcp dport 12345 counter
-  # Prove a service is listening before checking the firewall; a closed port
-  # or unsupported nc option must not make this test pass.
-  dc client1 sh -c 'mkdir -p /tmp/inbound; printf inbound > /tmp/inbound/index.html; python3 -m http.server 12345 --bind :: --directory /tmp/inbound >/tmp/inbound.log 2>&1 & echo $! >/tmp/inbound.pid'
-  wait_for 'inbound test listener' "dc client1 curl --noproxy '*' --fail --silent --max-time 2 'http://[::1]:12345/'"
-  [[ $(dc client1 curl --noproxy '*' --fail --silent --max-time 2 'http://[::1]:12345/') == inbound ]] || die 'inbound test listener is unavailable'
-  for name in isp dmz; do
-    if dc "$name" curl --noproxy '*' --fail --silent --max-time 2 "http://[$addr1]:12345/" >/dev/null 2>&1; then
-      die "new inbound TCP from $name unexpectedly connected"
-    fi
-  done
-  dc client1 sh -c 'kill $(cat /tmp/inbound.pid)'
-  if dc router nft list chain inet ndp64labcheck forward | grep -Eq 'tcp dport 12345 counter packets [1-9]'; then
-    die 'new inbound TCP passed the WAN firewall'
-  fi
-  dc router nft delete table inet ndp64labcheck
-  wait_for 'DMZ final active gateway registration' "dc dmz ping -6 -c 1 -W 2 $website6"
+  while read -r id release offset port; do select_subscriber "$id"; check_subscriber; done < <(subscribers)
   check_website dmz
-  check_registration_expiry
-  check_roaming
   note 'all acceptance checks passed'
 }
 
 up_applet() { require_no_args "$@"; do_up; }
 test_applet() { require_no_args "$@"; do_test; }
 purge_applet() { require_no_args "$@"; do_purge; }
-reset_applet() { require_no_args "$@"; do_purge; do_up; do_test; }
+reset_applet() { require_no_args "$@"; local preserve_build_cache=1; do_purge; do_up; do_test; }
 exec_applet() {
   (( $# > 0 )) || die 'usage: ./lab exec <container suffix> [command [arguments...]]'
   local suffix=$1

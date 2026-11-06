@@ -1,15 +1,34 @@
-FROM openwrt/rootfs:x86-64-24.10.4@sha256:1310ccbd24f30b3df6e210a48dbd0fb902445ee80e21ffc8b8e882b94987a411
+ARG OPENWRT_IMAGE=openwrt/rootfs:x86-64-25.12.6@sha256:14401c04218c2e0da0448f099710ada2460636a92395f353351cc616cf3f67af
+FROM ${OPENWRT_IMAGE} AS router
 ARG LAB_ID
 COPY --from=repositories / /
 LABEL org.ndp64lab.owner="$LAB_ID"
-RUN mkdir -p /var/lock /tmp && opkg update && opkg install ip-full ucode-mod-socket \
+# One package layer per release, shared by both router and LAN-only targets.
+RUN --mount=type=cache,target=/var/cache/lab-packages \
+    mkdir -p /var/lock /tmp \
+    && if command -v apk >/dev/null; then \
+         apk --cache-dir /var/cache/lab-packages update \
+         && apk --cache-dir /var/cache/lab-packages add bash socat tcpdump ip-full iputils-ping curl; \
+       else \
+         opkg update && opkg --cache /var/cache/lab-packages install bash socat tcpdump ip-full iputils-ping curl; \
+       fi \
     && uci -q delete 'firewall.@zone[0].network' \
-    && for n in 1 2 3 4 5 6 7 8; do uci add_list "firewall.@zone[0].network=lan$n"; done \
+    && for n in 1 2 3; do uci add_list "firewall.@zone[0].network=lan$n"; done \
     && uci commit firewall
-COPY router/register.uc /usr/sbin/lab-register.uc
-COPY router/dhcp /etc/config/dhcp
+COPY router/register /usr/sbin/lab-register
 COPY router/lab-ndp.init /etc/init.d/lab-ndp
-RUN chmod +x /etc/init.d/lab-ndp && ln -s ../init.d/lab-ndp /etc/rc.d/S95lab-ndp
+COPY build/firewall3-tables.init /etc/init.d/lab-xtables
 COPY build/no-kmsg.init /etc/init.d/lab-no-kmsg
-RUN chmod +x /etc/init.d/lab-no-kmsg && ln -s ../init.d/lab-no-kmsg /etc/rc.d/S01lab-no-kmsg
+RUN chmod +x /etc/init.d/lab-xtables /usr/sbin/lab-register /etc/init.d/lab-ndp /etc/init.d/lab-no-kmsg \
+    && ln -s ../init.d/lab-xtables /etc/rc.d/S18lab-xtables \
+    && ln -s ../init.d/lab-ndp /etc/rc.d/S95lab-ndp \
+    && ln -s ../init.d/lab-no-kmsg /etc/rc.d/S01lab-no-kmsg
+CMD ["/sbin/init"]
+
+FROM router AS client
+RUN /etc/init.d/lab-ndp disable \
+    && /etc/init.d/dnsmasq disable \
+    && /etc/init.d/odhcpd disable \
+    && /etc/init.d/uhttpd disable \
+    && printf '' > /etc/config/dhcp
 CMD ["/sbin/init"]
