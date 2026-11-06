@@ -189,11 +189,10 @@ learning disabled. Same-LAN client addresses are never proxied on their own
 LAN, so peer traffic stays on the Docker bridge.
 
 Each LAN has a distinct shared-prefix `::ff:1/64` through `::ff:8/64` address,
-provided to odhcpd through netifd. The image builds the packaged odhcpd
-revision from pinned source with a small
-patch allowing sub-minute PIO caps (upstream clamps these to 60 seconds).
-DHCP lease minimums remain unchanged. PIO lifetimes are capped at 30 seconds
-preferred and 60 seconds valid. RAs repeat every 5–10 seconds with a 30-second
+provided to odhcpd through netifd. The router uses the official odhcpd binary
+packaged in the pinned OpenWrt image, without local patches or rebuilding.
+Its minimum supported PIO caps are 60 seconds, so preferred and valid lifetimes
+are both capped at 60 seconds. RAs repeat every 5–10 seconds with a 30-second
 router lifetime. All ten LAN clients retain their SLAAC addresses through
 continued RAs; the DMZ keeps its static address.
 
@@ -213,10 +212,10 @@ retires its old kernel neighbor entry. odhcpd then removes stale proxies before
 they can falsely answer the moving client's DAD. Interface-bound probes confirm
 the new location; odhcpd continues to own routes and proxies. Failed and
 incomplete relay probes are not previous client locations. The helper leaves
-them alone, and odhcpd tracks which confirmed neighbors installed relay state.
-Removing an unsuccessful probe, including through kernel garbage collection,
-cannot tear down another LAN's valid proxies. Acceptance checks create and
-remove failed probes while monitoring proxies and client2-to-client5 traffic.
+them alone. Stock odhcpd reconciles routes and proxies after neighbor removal;
+connectivity checks allow up to ten seconds for NDP and reconciliation.
+Acceptance checks explicitly remove failed relay probes and require recovery
+of client2-to-client5 traffic without restarting services.
 
 The separately built ISP-only `/usr/sbin/isp-ndp-learn` receives and validates
 NS packets. Both subscriber learners are supervised inside the ISP container,
@@ -238,9 +237,8 @@ containers before boot. Deployment manifests stay on the host for validation;
 website content is mounted. OpenWrt containers mask `/proc/kmsg` with
 `/dev/null` so competing readers of the shared host kernel log cannot block
 logd and DHCP replies. There is no interface remapping or host-driven
-peer address configuration. Native build revisions are pinned in
-`build/native-sources.lock`; source checkouts are retained under
-`~/Building/ndp64lab-sources`.
+peer address configuration. Existing source checkouts remain under `~/Building/ndp64lab-sources`; the
+router build uses the official packaged daemon.
 
 ### Expected Traffic
 

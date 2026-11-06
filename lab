@@ -268,7 +268,7 @@ check_image_owned_or_free() {
   [[ $owner == "$prefix" ]] || die "image tag $1 belongs to another owner"
 }
 wait_for() {
-  local description=$1 command=$2 deadline=$((SECONDS + 60))
+  local description=$1 command=$2 deadline=$((SECONDS + ${3:-60}))
   until eval "$command" >/dev/null 2>&1; do
     (( SECONDS < deadline )) || die "timed out waiting for $description"
     sleep 1
@@ -303,16 +303,6 @@ build_image() {
     --build-context "repositories=$repositories" "$@" -f "$here/$dockerfile" -t "$image" "$here"
   rm -rf -- "$repositories"
 }
-prepare_native_sources() {
-  local name revision checkout root=${NDP64LAB_SOURCES:-$HOME/Building/ndp64lab-sources}
-  mkdir -p "$root" "$generated/native-sources"
-  while read -r name revision; do
-    checkout=$root/$name
-    if [[ ! -d $checkout/.git ]]; then git clone "https://github.com/openwrt/$name.git" "$checkout"; fi
-    mkdir -p "$generated/native-sources/$name"
-    git -C "$checkout" archive "$revision" | tar -xf - -C "$generated/native-sources/$name"
-  done < "$here/build/native-sources.lock"
-}
 build_images() {
   if [[ -n ${BUILD_MIRROR:-} ]]; then command -v curl >/dev/null || die 'BUILD_MIRROR requires curl on the host'; fi
   mkdir -p "$generated"
@@ -326,11 +316,7 @@ build_images() {
   router_base=$(awk '$1 == "FROM" {base=$2} END {print base}' "$here/Dockerfile.router")
   build_image Dockerfile.isp "$isp_image" "$alpine_base"
   build_image Dockerfile.peer "$peer_image" "$alpine_base"
-  prepare_native_sources
-  prepare_build_repositories "$alpine_base" "$generated/native-repositories"
-  build_image Dockerfile.router "$router_image" "$router_base" \
-    --build-context "native-repositories=$generated/native-repositories" \
-    --build-context "native-sources=$generated/native-sources"
+  build_image Dockerfile.router "$router_image" "$router_base"
   build_image Dockerfile.client-debian "$debian_image" debian:trixie-slim
   build_image Dockerfile.client-alpine "$alpine_image" "$alpine_base"
   build_image Dockerfile.client-openwrt "$fw3_image" "$fw3_base" --build-arg "OPENWRT_IMAGE=$fw3_base"
@@ -627,7 +613,7 @@ check_lifetimes() {
     preferred=$(awk '/preferred_lft/ {for(i=1;i<=NF;i++) if($i=="preferred_lft") {gsub(/sec/,"",$(i+1));print $(i+1)}}' <<< "$output")
     valid=$(awk '/valid_lft/ {for(i=1;i<=NF;i++) if($i=="valid_lft") {gsub(/sec/,"",$(i+1));print $(i+1)}}' <<< "$output")
     [[ $preferred =~ ^[0-9]+$ && $valid =~ ^[0-9]+$ ]] || die "cannot read $name lifetimes"
-    (( preferred <= 30 && valid <= 60 && valid > 0 )) || die "$name lifetimes exceed 30/60: $output"
+    (( preferred <= 60 && valid <= 60 && valid > 0 )) || die "$name lifetimes exceed 60/60: $output"
   done
 }
 # Move the existing host veth rather than replacing eth0 or its MAC. Docker's
@@ -714,27 +700,20 @@ check_roaming() (
 check_failed_probe() (
   local address=${addresses[client5]} attempt
   cleanup_probe() {
-    dc router sh -c 'test ! -f /tmp/probe-monitor.pid || kill $(cat /tmp/probe-monitor.pid)' >/dev/null 2>&1 || true
     dc router ip -6 neigh del "$address" dev eth3 >/dev/null 2>&1 || true
   }
   trap cleanup_probe EXIT
-  dc router sh -c 'ip -6 monitor neigh >/tmp/probe-monitor.log 2>&1 & echo $! >/tmp/probe-monitor.pid'
-  sleep 1
-  # A failed relay probe may disappear naturally through kernel GC. Explicitly
-  # exercise its removal too; neither path may tear down confirmed proxies.
+  # Stock odhcpd reconciles relay state after neighbor removal. Exercise
+  # failed probe cleanup and require recovery without restarting services.
+  # The kernel may garbage-collect FAILED entries at any time.
   for attempt in {1..5}; do
     dc router ip -6 neigh replace "$address" dev eth3 nud failed
     dc router ip -6 neigh del "$address" dev eth3 >/dev/null 2>&1 || true
-    sleep 1
+    wait_for 'client2 to client5 after relay probe cleanup' "dc client2 ping -6 -c 1 -W 2 $address" 10
     assert_contains "$(dc router ip -6 route show exact "$address/128")" 'dev eth5'
     assert_contains "$(dc router ip -6 neigh show proxy dev eth2)" "$address"
-    dc client2 ping -6 -c 1 -W 2 "$address" >/dev/null || die 'failed relay probe interrupted client2 to client5'
   done
-  dc router sh -c 'kill -0 $(cat /tmp/probe-monitor.pid)' || die 'neighbor monitor stopped'
-  if dc router cat /tmp/probe-monitor.log | grep -F "$address" | grep -E '^Deleted.*proxy' >/dev/null; then
-    die 'failed relay probe removal tore down a confirmed proxy'
-  fi
-  note 'failed relay probe removal preserves confirmed routes, proxies and connectivity'
+  note 'relay probe cleanup recovers routes, proxies and client2-to-client5 connectivity'
 )
 check_registration_expiry() (
   # A subshell EXIT trap restores registration even when an assertion exits.
@@ -864,7 +843,9 @@ do_test() {
     for peer in client{1..8} client1b; do
       [[ ${lans[$name]} == "${lans[$peer]}" ]] && continue
       dc "$name" ping -4 -c 1 -W 2 "${ipv4[$peer]}" >/dev/null || die "$name cannot reach $peer over IPv4"
-      dc "$name" ping -6 -c 1 -W 2 "${addresses[$peer]}" >/dev/null || die "$name cannot reach $peer over IPv6"
+      # Allow kernel NDP and odhcpd reconciliation to finish; a single echo
+      # with a two-second deadline can expire during neighbor resolution.
+      wait_for "$name IPv6 connectivity to $peer" "dc $name ping -6 -c 1 -W 2 ${addresses[$peer]}" 10
     done
   done
   note 'all cross-LAN IPv4 and IPv6 pairs passed'

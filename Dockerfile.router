@@ -1,12 +1,3 @@
-FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc AS native
-COPY --from=native-repositories / /
-RUN apk add --no-cache build-base cmake json-c-dev linux-headers
-COPY --from=native-sources / /src/
-COPY build/odhcpd-lifetime-caps.patch /tmp/lifetimes.patch
-COPY build/odhcpd-relay-neighbor-ownership.patch /tmp/relay-neighbors.patch
-COPY build/build-odhcpd.sh /build-odhcpd.sh
-RUN sh /build-odhcpd.sh
-
 FROM openwrt/rootfs:x86-64-24.10.4@sha256:1310ccbd24f30b3df6e210a48dbd0fb902445ee80e21ffc8b8e882b94987a411
 ARG LAB_ID
 COPY --from=repositories / /
@@ -16,7 +7,6 @@ RUN mkdir -p /var/lock /tmp && opkg update && opkg install ip-full ucode-mod-soc
     && for n in 1 2 3 4 5 6 7 8; do uci add_list "firewall.@zone[0].network=lan$n"; done \
     && uci commit firewall
 COPY router/register.uc /usr/sbin/lab-register.uc
-COPY --from=native /odhcpd /usr/sbin/odhcpd
 COPY router/dhcp /etc/config/dhcp
 COPY router/lab-ndp.init /etc/init.d/lab-ndp
 RUN chmod +x /etc/init.d/lab-ndp && ln -s ../init.d/lab-ndp /etc/rc.d/S95lab-ndp
