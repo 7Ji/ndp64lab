@@ -13,7 +13,7 @@ let prefix = slice(iptoarr(target), 0, 8);
 let wan = bus.call('network.interface.' + uci.get('network', route, 'interface'), 'status', {}).l3_device;
 if (!wan) die('WAN device is not ready\n');
 let mac = map(split(trim(readfile('/sys/class/net/' + wan + '/address')), ':'), x => hex(x));
-let sockets = [], devices = {}, candidates = {}, next = {}, probes = {};
+let sockets = [], devices = {}, candidates = {}, next = {}, probes = {}, known = [];
 function jsoncmd(cmd) {
  let f = popen(cmd, 'r');
  let data = f.read('all'); f.close();
@@ -70,6 +70,16 @@ while (true) {
   if (!(event[1] & sock.POLLIN)) continue;
   let from = {}, frame = event[0].recv(4096, 0, from);
   if (!frame || from.packet_type == sock.PACKET_OUTGOING || length(frame) < 54 || ord(frame, 14) >> 4 != 6) continue;
+  // A previously confirmed MAC appearing on a different LAN is a physical
+  // move. Retire its old neighbor immediately, before a stale proxy can
+  // answer the returning client's DAD and falsely report a duplicate.
+  let source_mac = join(':', map([6,7,8,9,10,11], i => sprintf('%02x', ord(frame, i))));
+  for (let old in known) {
+   if (old.lladdr != source_mac || old.dev == event[2]) continue;
+   system(['ip', '-6', 'neigh', 'del', old.dst, 'dev', old.dev]);
+   candidates[old.dst] = { dev: event[2], seen: time(), probe: 0 };
+  }
+  known = filter(known, old => old.lladdr != source_mac || old.dev == event[2]);
   let src = address(substr(frame, 22, 16));
   if (shared(src)) candidates[src] = { dev: event[2], seen: time(), probe: 0 };
   if (ord(frame, 20) == 58 && length(frame) >= 78 && ord(frame, 54) == 135 && src == '::') {
@@ -86,11 +96,29 @@ while (true) {
   for (let a in link.addr_info || [])
    if (shared(a.local) && !a.tentative && !a.dadfailed) active[a.local] = true;
  }
- for (let n in jsoncmd('ip -j -6 neigh show')) {
-  if (!devices[n.dev] || !shared(n.dst)) continue;
+ let neighbors = jsoncmd('ip -j -6 neigh show'), confirmed = {}, moved = {};
+ known = filter(neighbors, n => devices[n.dev] && shared(n.dst) && n.lladdr && !match(join(' ', n.state || []), /FAILED|INCOMPLETE/));
+ // A sighting on another LAN is only a candidate. Resolve it there before
+ // discarding the previous neighbor; odhcpd reacts to the kernel events and
+ // updates its routes/proxies, including removal of the proxy on the new LAN.
+ for (let addr, c in candidates) {
+  if (active[addr]) continue; // Router-owned addresses do not roam.
+  for (let n in neighbors) {
+   if (n.dst != addr || n.dev != c.dev || !n.lladdr || match(join(' ', n.state || []), /FAILED|INCOMPLETE/)) continue;
+   for (let old in neighbors) {
+    if (old.dst == addr && old.dev != c.dev && devices[old.dev]) {
+     if (system(['ip', '-6', 'neigh', 'del', addr, 'dev', old.dev]) == 0)
+      warn('Moved ' + addr + ' from ' + old.dev + ' to ' + c.dev + '\n');
+     moved[addr] = c.dev;
+    }
+   }
+  }
+ }
+ for (let n in neighbors) {
+  if (!devices[n.dev] || !shared(n.dst) || (moved[n.dst] && moved[n.dst] != n.dev)) continue;
   let state = join(' ', n.state || []);
   if (n.lladdr && !match(state, /FAILED|INCOMPLETE/)) {
-   active[n.dst] = true;
+   active[n.dst] = true; confirmed[n.dst] = n.dev;
    // Sending through a STALE entry triggers kernel NUD. Removed addresses
    // eventually become FAILED instead of being registered indefinitely.
    if (!probes[n.dst] || now >= probes[n.dst]) {
@@ -100,7 +128,7 @@ while (true) {
  }
  for (let addr, c in candidates) {
   if (now - c.seen > 60) { delete candidates[addr]; continue; }
-  if (!active[addr] && now - c.probe >= 3) { probe(addr, c.dev); c.probe = now; }
+  if ((!active[addr] || (confirmed[addr] && confirmed[addr] != c.dev)) && now - c.probe >= 3) { probe(addr, c.dev); c.probe = now; }
  }
  for (let addr in next) if (!active[addr]) { delete next[addr]; delete probes[addr]; }
  for (let addr in active) if (!next[addr] || now >= next[addr]) next[addr] = now + (register(addr) ? 5 : 3);

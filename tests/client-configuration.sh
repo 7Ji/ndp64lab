@@ -15,7 +15,7 @@ client6 6 10 networkd
 client7 7 10 networkmanager
 client8 8 10 alpine
 client1b 1 11 fw3'
-[[ $(clients) == "$expected" && $(tail -n +2 "$generated/client-manifest") == "$expected" ]]
+[[ $(clients) == "$expected" && $(tail -n +2 "$generated/client-manifest") == "$expected"$'\nroaming 1 dhcp networkd' ]]
 # Check distinct LAN addresses and manager policies, including the extra LAN1 peer.
 grep -q 'Address=192.168.6.10/24' "$generated/clients/client6/network"
 grep -q 'IPv6AcceptRA=yes' "$generated/clients/client1/network"
@@ -30,3 +30,5 @@ for name in client4 client5 client1b; do
   ! grep -Eq "config interface 'wan|masq" "$generated/clients/$name/network" "$generated/clients/$name/firewall"
 done
 printf 'client mix and native manager configuration checks passed\n'
+grep -q '^DHCP=ipv4$' "$generated/clients/roaming/network"
+! grep -q '^Address=' "$generated/clients/roaming/network"

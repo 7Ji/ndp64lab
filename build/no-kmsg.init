@@ -1,0 +1,7 @@
+#!/bin/sh /etc/rc.common
+# Privileged containers share the host kernel log. Competing readers can
+# block logd, filling its syslog socket and stalling services such as DHCP.
+START=01
+start() {
+ mount -o bind /dev/null /proc/kmsg
+}

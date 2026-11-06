@@ -1,9 +1,10 @@
 # ndp64lab
 
-An isolated thirteen-container OpenWrt 24.10.4 lab for one shared IPv6 /64
+An isolated fourteen-container OpenWrt 24.10.4 lab for one shared IPv6 /64
 across eight separate LANs. The containers use eleven Docker bridge links:
 ISP-to-WAN, ISP-to-public-website, ISP-to-DMZ, and one link per LAN. LAN1 has
-two clients; LAN2 through LAN8 have one each. Docker's bridge-assigned addresses are replaced with the lab's
+two static clients; LAN2 through LAN8 have one each. A DHCPv4 roaming client
+starts on LAN1. Docker's bridge-assigned addresses are replaced with the lab's
 generated IPv4 fixtures. No host interface addresses are read.
 
 ## Requirements
@@ -32,7 +33,7 @@ From the repository root:
 ```
 
 `exec` takes a container suffix (`router`, `isp`, `dmz`, `website`,
-`client1` through `client8`, or `client1b`) followed by an optional command
+`client1` through `client8`, `client1b`, or `roaming`) followed by an optional command
 and its arguments. Without a command, it opens an interactive shell, which
 requires a terminal. Command arguments are passed directly to the container.
 The lifecycle applets take no extra arguments. `up` reports an existing lab; use `reset`
@@ -128,8 +129,8 @@ have only a LAN interface, with no WAN, DHCP server, NAT, or prefix delegation.
 25.12.6 is the latest stable OpenWrt image available when this mix was added;
 there is no published OpenWrt 26 release. Both OpenWrt client images are pinned
 by digest. Debian uses `debian:trixie-slim` and the Trixie package feeds.
-The ISP, website, and DMZ retain the Alpine peer image. All client managers
-configure the existing static IPv4 fixtures, accept SLAAC and RA default routes,
+The ISP, website, and DMZ retain the Alpine peer image. The nine existing client managers
+configure static IPv4 fixtures, accept SLAAC and RA default routes,
 and disable temporary IPv6 addresses. Debian explicitly uses EUI-64 addresses.
 OpenWrt's `lan6` is an IPv6 protocol interface on the same LAN Ethernet device;
 it requests neither DHCPv6 addresses nor delegated prefixes. Its LAN firewall
@@ -138,6 +139,12 @@ accepts local traffic while rejecting forwarding.
 Generated manager configuration is under `.generated/clients/`. Tests verify
 the assigned manager and OpenWrt firewall in addition to connectivity. Existing
 deployments need `./lab reset`; `./lab test` rejects an old client mix.
+
+The additional `roaming` client uses Debian Trixie and systemd-networkd with
+DHCPv4 and EUI-64 SLAAC. Its fixed MAC is derived from the seed `192.168.0.12`
+(`02:42:c0:a8:00:0c`); this seed is not an assigned IPv4 address. Each router
+LAN runs dnsmasq DHCPv4 with a `.100`–`.199` pool and five-minute leases,
+outside the static clients' `.10` and `.11` addresses. DHCPv6 stays disabled.
 
 ### Routing Behavior
 
@@ -187,7 +194,7 @@ revision from pinned source with a small
 patch allowing sub-minute PIO caps (upstream clamps these to 60 seconds).
 DHCP lease minimums remain unchanged. PIO lifetimes are capped at 30 seconds
 preferred and 60 seconds valid. RAs repeat every 5–10 seconds with a 30-second
-router lifetime. All nine LAN clients retain their SLAAC addresses through
+router lifetime. All ten LAN clients retain their SLAAC addresses through
 continued RAs; the DMZ keeps its static address.
 
 UCI specifies the link-local default gateway, a direct `/128` route to the
@@ -201,6 +208,10 @@ sockets, nonlocal binding, the WAN MAC, and kernel-generated checksums.
 Startup reconciles existing neighbors, new addresses register immediately,
 successful sends refresh every five seconds, and failures retry after three.
 Removed addresses stop refreshing; network and DHCP changes reload the service.
+When a confirmed neighbor's MAC appears on another LAN, the helper immediately
+retires its old kernel neighbor entry. odhcpd then removes stale proxies before
+they can falsely answer the moving client's DAD. Interface-bound probes confirm
+the new location; odhcpd continues to own routes and proxies.
 
 The separately built ISP-only `/usr/sbin/isp-ndp-learn` receives and validates
 NS packets. Both subscriber learners are supervised inside the ISP container,
@@ -219,7 +230,9 @@ so active traffic can renew the registration naturally.
 
 Native manager configuration is generated on the host and copied into stopped
 containers before boot. Deployment manifests stay on the host for validation;
-only website content is mounted. There is no interface remapping or host-driven
+website content is mounted. OpenWrt containers mask `/proc/kmsg` with
+`/dev/null` so competing readers of the shared host kernel log cannot block
+logd and DHCP replies. There is no interface remapping or host-driven
 peer address configuration. Native build revisions are pinned in
 `build/native-sources.lock`; source checkouts are retained under
 `~/Building/ndp64lab-sources`.
@@ -253,8 +266,8 @@ After changing a naming seed, run `./lab reset` to deploy the new addresses;
 `./lab test` rejects seeds that differ from the running deployment's manifest.
 
 Existing deployments need `./lab reset` to apply the MAC formula; client SLAAC
-addresses may change. `test` checks all 23 interface MACs against their intended
-IPv4 addresses and reports mismatches with reset instructions.
+addresses may change. `test` checks all 24 interface MACs against their
+address seeds and reports mismatches with reset instructions.
 
 `test` checks that each client has one global SLAAC address, IPv4 and IPv6
 traffic between every pair of LANs, outbound IPv4 to the ISP, IPv6 in both
@@ -278,3 +291,14 @@ odhcpd and native client managers continue. During ongoing client traffic, ISP
 registrations expire naturally while the same valid SLAAC addresses and LAN
 connectivity remain. Restarting registration must restore upstream connectivity
 without restarting client networking. A trap restores the service on failure.
+
+The roaming acceptance test visits LAN1 through LAN8 twice. It moves the same
+host veth between the lab bridges with a brief carrier interruption, preserving
+the client interface and MAC. Docker's endpoint metadata remains on LAN1; an
+exit trap returns the veth there. At every visit the test requires a DHCPv4
+lease and gateway for that LAN, the same SLAAC address, correct learned routing,
+HTTP integrity over both protocols, and direct IPv6 access to the local static
+client. One IPv6 TCP connection to the ISP exchanges checked bidirectional
+payloads throughout both loops. Brief handoff stalls are allowed; the connection
+must stay open and resume transferring, with no reconnect path. Existing static
+clients are checked again afterward.

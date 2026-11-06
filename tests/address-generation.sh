@@ -46,7 +46,7 @@ check_endpoint_macs() {
     (( (16#$first & 3) == 2 )) # Locally administered and unicast.
     count=$((count + 1))
   done < <(interface_addresses)
-  [[ $count == 23 && ${#seen[@]} == 23 ]]
+  [[ $count == 24 && ${#seen[@]} == 24 ]]
 }
 check_endpoint_macs
 

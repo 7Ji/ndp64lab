@@ -30,6 +30,7 @@ clients() {
 client_manifest() {
   printf 'images %s %s %s %s\n' "$debian_image" "$alpine_image" "$fw3_image" "$fw4_image"
   clients
+  printf '%s\n' 'roaming 1 dhcp networkd'
 }
 prepare_clients() {
   local name lan host kind config
@@ -121,6 +122,22 @@ EOF
         ;;
     esac
   done < <(clients)
+  mkdir -p "$generated/clients/roaming"
+  cat > "$generated/clients/roaming/network" <<'EOF'
+[Match]
+Name=eth0
+[Network]
+DHCP=ipv4
+IPv6AcceptRA=yes
+IPv6PrivacyExtensions=no
+LinkLocalAddressing=ipv6
+[DHCPv4]
+ClientIdentifier=mac
+UseDNS=no
+[IPv6AcceptRA]
+Token=eui64
+UseDNS=no
+EOF
   client_manifest > "$generated/client-manifest"
 }
 
@@ -201,7 +218,7 @@ interface_addresses() {
   for n in {1..8}; do
     printf '%s\n' "router eth$n 192.168.$n.1" "client$n eth0 192.168.$n.10"
   done
-  printf '%s\n' 'client1b eth0 192.168.1.11'
+  printf '%s\n' 'client1b eth0 192.168.1.11' 'roaming eth0 192.168.0.12'
 }
 endpoint_network() {
   printf 'name=%s,mac-address=%s,driver-opt=com.docker.network.endpoint.ifname=%s' \
@@ -214,7 +231,7 @@ check_interface_macs() {
     actual=$(dc "$name" cat "/sys/class/net/$interface/address" 2>/dev/null) || actual=missing
     [[ $actual == "$expected" ]] || die "$name $interface MAC is $actual; expected $expected from $address; run ./lab reset"
   done < <(interface_addresses)
-  note 'all 23 interface MACs match their IPv4 addresses'
+  note 'all 24 interface MACs match their address seeds'
 }
 address_manifest() {
   printf 'shared6=%s\nisp_customer6=%s\nwebsite4=%s\nwebsite6=%s\n' \
@@ -455,6 +472,14 @@ start_clients() {
     case $kind in fw3|fw4) copy_config "$name" "$generated/clients/$name/firewall" /etc/config/firewall ;; esac
     docker start "$(container "$name")" >/dev/null
   done < <(clients)
+  start_roaming
+}
+start_roaming() {
+  docker create --privileged --name "$(container roaming)" --label "$label" \
+    --cgroupns private --tmpfs /run --tmpfs /run/lock --tmpfs /tmp --env container=docker \
+    --env LAB_CLIENT_KIND=networkd --network "$(endpoint_network 1 eth0 192.168.0.12)" "$debian_image" >/dev/null
+  copy_config roaming "$generated/clients/roaming/network" /etc/systemd/network/20-lab.network
+  docker start "$(container roaming)" >/dev/null
 }
 start_router() {
   local n
@@ -482,7 +507,7 @@ do_up() {
   load_addresses
   require_tools
   local name
-  for name in isp router website dmz client{1..8} client1b; do check_name_free "$(container "$name")"; done
+  for name in isp router website dmz client{1..8} client1b roaming; do check_name_free "$(container "$name")"; done
   for name in "$router_image" "$isp_image" "$peer_image" "$debian_image" "$alpine_image" "$fw3_image" "$fw4_image"; do
     check_image_owned_or_free "$name"
   done
@@ -494,6 +519,8 @@ do_up() {
   start_router
   wait_for 'native client managers' 'check_client_managers'
   for name in client{1..8} client1b; do wait_for "$name initial SLAAC" "[[ -n \$(client_addr $name) ]]"; done
+  wait_for 'roaming client DHCPv4 lease' "dc roaming ip -o -4 addr show dev eth0 | grep -q 'inet 192.168.1.'"
+  wait_for 'roaming client SLAAC' '[[ -n $(client_addr roaming) ]]'
   check_lifetimes
   note 'lab is up'
 }
@@ -594,7 +621,7 @@ check_client_managers() {
 }
 check_lifetimes() {
   local name output preferred valid
-  for name in client{1..8} client1b; do
+  for name in client{1..8} client1b roaming; do
     output=$(dc "$name" ip -6 addr show dev eth0 scope global)
     [[ $output != *forever* ]] || die "$name has infinite SLAAC lifetimes: $output"
     preferred=$(awk '/preferred_lft/ {for(i=1;i<=NF;i++) if($i=="preferred_lft") {gsub(/sec/,"",$(i+1));print $(i+1)}}' <<< "$output")
@@ -603,6 +630,87 @@ check_lifetimes() {
     (( preferred <= 30 && valid <= 60 && valid > 0 )) || die "$name lifetimes exceed 30/60: $output"
   done
 }
+# Move the existing host veth rather than replacing eth0 or its MAC. Docker's
+# endpoint remains assigned to LAN1; the test restores that bridge on exit.
+move_roaming() {
+  local lan=$1 bridge network_id peer_index
+  [[ $lan =~ ^[1-8]$ ]] || die "invalid roaming LAN: $lan"
+  owned_network "$(network "$lan")" || die 'roaming target network is not lab-owned'
+  network_id=$(docker network inspect -f '{{.Id}}' "$(network "$lan")")
+  bridge=$(docker network inspect -f '{{index .Options "com.docker.network.bridge.name"}}' "$(network "$lan")")
+  [[ -n $bridge ]] || bridge=br-${network_id:0:12}
+  [[ $(dc roaming cat /sys/class/net/eth0/address) == "$(mac_from_ipv4 192.168.0.12)" ]] || die 'roaming MAC changed'
+  peer_index=$(dc roaming cat /sys/class/net/eth0/iflink)
+  docker run --rm -i --privileged --network host --label "$label" "$peer_image" \
+    sh -s -- "$peer_index" "$bridge" < "$here/tests/move-roaming.sh"
+}
+roaming_step_ready() {
+  local lan=$1 address=$2 previous=$3 port=$4
+  [[ $(client_addr roaming) == "$address" ]] || return 1
+  dc roaming ip -o -4 addr show dev eth0 | awk -v net="192.168.$lan." '
+    $3 == "inet" && index($4, net) == 1 {split($4,a,"/"); split(a[1],o,"."); if (o[4]>=100 && o[4]<=199) good=1}
+    END {exit !good}' || return 1
+  [[ $(dc roaming ip -4 route show default) == *"via 192.168.$lan.1 dev eth0"* ]] || return 1
+  [[ $(dc router ip -6 route get "$address") == *"dev eth$lan "* ]] || return 1
+  dc roaming python3 -c '
+import json,sys
+s=json.load(open("/tmp/roaming-state.json"))
+assert s["status"]=="running" and s["sequence"]>int(sys.argv[1])
+assert s["source"]==sys.argv[2] and s["local_port"]==int(sys.argv[3])
+' "$previous" "$address" "$port"
+}
+check_roaming() (
+  restore_roaming() {
+    dc roaming touch /tmp/roaming-stop >/dev/null 2>&1 || true
+    for endpoint in roaming isp; do
+      dc "$endpoint" sh -c 'test ! -f /tmp/roaming-traffic.pid || kill $(cat /tmp/roaming-traffic.pid)' >/dev/null 2>&1 || true
+    done
+    move_roaming 1 >/dev/null 2>&1 || true
+  }
+  trap restore_roaming EXIT
+  local name n loop address interface_index port previous state
+  move_roaming 1
+  wait_for 'roaming initial SLAAC' '[[ -n $(client_addr roaming) ]]'
+  address=$(client_addr roaming)
+  interface_index=$(dc roaming cat /sys/class/net/eth0/ifindex)
+  dc roaming systemctl is-active --quiet systemd-networkd
+  for n in {1..8}; do
+    [[ $(dc router uci -q get "dhcp.lan$n.dhcpv4") == server ]] || die "DHCPv4 is disabled on LAN$n"
+  done
+  for name in isp roaming; do
+    docker exec -i "$(container "$name")" sh -c 'cat > /tmp/roaming-traffic.py' < "$here/tests/roaming-traffic.py"
+    dc "$name" sh -c 'rm -f /tmp/roaming-state.json /tmp/roaming-stop'
+  done
+  dc isp sh -c 'python3 -u /tmp/roaming-traffic.py server "$1" >/tmp/roaming-traffic.log 2>&1 & echo $! >/tmp/roaming-traffic.pid' sh "$isp_customer6"
+  wait_for 'roaming TCP listener' "dc isp test -f /tmp/roaming-state.json"
+  # Establish once. Neither the traffic program nor the move loop reconnects.
+  wait_for 'roaming initial WAN registration' "dc roaming ping -6 -c 1 -W 2 $isp_customer6"
+  dc roaming sh -c 'python3 -u /tmp/roaming-traffic.py client "$1" --source "$2" >/tmp/roaming-traffic.log 2>&1 & echo $! >/tmp/roaming-traffic.pid' sh "$isp_customer6" "$address"
+  wait_for 'persistent roaming TCP connection' 'dc roaming test -f /tmp/roaming-state.json'
+  port=$(dc roaming python3 -c 'import json; print(json.load(open("/tmp/roaming-state.json"))["local_port"])')
+  for loop in 1 2; do
+    for n in {1..8}; do
+      previous=$(dc roaming python3 -c 'import json; print(json.load(open("/tmp/roaming-state.json"))["sequence"])')
+      move_roaming "$n"
+      wait_for "roaming loop $loop LAN$n DHCPv4 and existing TCP progress" "roaming_step_ready $n $address $previous $port"
+      [[ $(dc roaming cat /sys/class/net/eth0/ifindex) == "$interface_index" ]] || die 'roaming replaced the Ethernet interface'
+      [[ $(dc roaming cat /sys/class/net/eth0/address) == "$(mac_from_ipv4 192.168.0.12)" ]] || die 'roaming changed its MAC'
+      [[ $(dc router ip -6 neigh show proxy dev "eth$n") != *"$address proxy"* ]] || die 'roaming is proxied on its current LAN'
+      assert_contains "$(dc isp ip -6 route show exact "$address/128")" "$address dev eth0"
+      assert_contains "$(dc router cat /tmp/dhcp.leases)" "$(mac_from_ipv4 192.168.0.12) 192.168.$n."
+      check_website roaming
+      # Check direct connectivity with the existing static client on this LAN.
+      dc roaming ping -6 -c 1 -W 2 "$(client_addr "client$n")" >/dev/null || die "roaming cannot reach its LAN$n peer"
+      note "roaming loop $loop LAN$n: DHCPv4, unchanged MAC/IPv6, existing TCP stream, HTTP and local peer passed"
+    done
+  done
+  dc roaming touch /tmp/roaming-stop
+  wait_for 'roaming traffic completion' "dc roaming python3 -c 'import json; assert json.load(open(\"/tmp/roaming-state.json\"))[\"status\"]==\"finished\"'"
+  dc isp python3 -c 'import json; s=json.load(open("/tmp/roaming-state.json")); assert s["accepted"]==1 and s["source"]=="'"$address"'"'
+  state=$(dc roaming cat /tmp/roaming-state.json)
+  note "two roaming loops retained one IPv6 TCP connection: $state"
+  check_client_managers || die 'a static client changed while roaming'
+)
 check_registration_expiry() (
   # A subshell EXIT trap restores registration even when an assertion exits.
   restore_registration() {
@@ -777,6 +885,7 @@ do_test() {
   wait_for 'DMZ final active gateway registration' "dc dmz ping -6 -c 1 -W 2 $website6"
   check_website dmz
   check_registration_expiry
+  check_roaming
   note 'all acceptance checks passed'
 }
 

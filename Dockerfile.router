@@ -19,4 +19,6 @@ COPY --from=native /odhcpd /usr/sbin/odhcpd
 COPY router/dhcp /etc/config/dhcp
 COPY router/lab-ndp.init /etc/init.d/lab-ndp
 RUN chmod +x /etc/init.d/lab-ndp && ln -s ../init.d/lab-ndp /etc/rc.d/S95lab-ndp
+COPY build/no-kmsg.init /etc/init.d/lab-no-kmsg
+RUN chmod +x /etc/init.d/lab-no-kmsg && ln -s ../init.d/lab-no-kmsg /etc/rc.d/S01lab-no-kmsg
 CMD ["/sbin/init"]
