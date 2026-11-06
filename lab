@@ -711,6 +711,31 @@ check_roaming() (
   note "two roaming loops retained one IPv6 TCP connection: $state"
   check_client_managers || die 'a static client changed while roaming'
 )
+check_failed_probe() (
+  local address=${addresses[client5]} attempt
+  cleanup_probe() {
+    dc router sh -c 'test ! -f /tmp/probe-monitor.pid || kill $(cat /tmp/probe-monitor.pid)' >/dev/null 2>&1 || true
+    dc router ip -6 neigh del "$address" dev eth3 >/dev/null 2>&1 || true
+  }
+  trap cleanup_probe EXIT
+  dc router sh -c 'ip -6 monitor neigh >/tmp/probe-monitor.log 2>&1 & echo $! >/tmp/probe-monitor.pid'
+  sleep 1
+  # A failed relay probe may disappear naturally through kernel GC. Explicitly
+  # exercise its removal too; neither path may tear down confirmed proxies.
+  for attempt in {1..5}; do
+    dc router ip -6 neigh replace "$address" dev eth3 nud failed
+    dc router ip -6 neigh del "$address" dev eth3 >/dev/null 2>&1 || true
+    sleep 1
+    assert_contains "$(dc router ip -6 route show exact "$address/128")" 'dev eth5'
+    assert_contains "$(dc router ip -6 neigh show proxy dev eth2)" "$address"
+    dc client2 ping -6 -c 1 -W 2 "$address" >/dev/null || die 'failed relay probe interrupted client2 to client5'
+  done
+  dc router sh -c 'kill -0 $(cat /tmp/probe-monitor.pid)' || die 'neighbor monitor stopped'
+  if dc router cat /tmp/probe-monitor.log | grep -F "$address" | grep -E '^Deleted.*proxy' >/dev/null; then
+    die 'failed relay probe removal tore down a confirmed proxy'
+  fi
+  note 'failed relay probe removal preserves confirmed routes, proxies and connectivity'
+)
 check_registration_expiry() (
   # A subshell EXIT trap restores registration even when an assertion exits.
   restore_registration() {
@@ -843,6 +868,7 @@ do_test() {
     done
   done
   note 'all cross-LAN IPv4 and IPv6 pairs passed'
+  check_failed_probe
   addr1=${addresses[client1]}
   addr1b=${addresses[client1b]}
   dc client1b ping -6 -c 2 -W 2 "$addr1" >/dev/null || die 'LAN1 peers cannot communicate'

@@ -106,7 +106,11 @@ while (true) {
   for (let n in neighbors) {
    if (n.dst != addr || n.dev != c.dev || !n.lladdr || match(join(' ', n.state || []), /FAILED|INCOMPLETE/)) continue;
    for (let old in neighbors) {
-    if (old.dst == addr && old.dev != c.dev && devices[old.dev]) {
+    // odhcpd probes other LANs during NDP relay. Failed or incomplete probes
+    // are not old client locations: deleting them churns valid proxies on
+    // every other LAN while odhcpd processes the deletion and neighbor dump.
+    if (old.dst == addr && old.dev != c.dev && devices[old.dev] &&
+        old.lladdr && !match(join(' ', old.state || []), /FAILED|INCOMPLETE/)) {
      if (system(['ip', '-6', 'neigh', 'del', addr, 'dev', old.dev]) == 0)
       warn('Moved ' + addr + ' from ' + old.dev + ' to ' + c.dev + '\n');
      moved[addr] = c.dev;

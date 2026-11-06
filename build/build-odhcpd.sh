@@ -10,6 +10,7 @@ for name in libubox uci libnl-tiny ubus; do
 done
 cd /src/odhcpd
 patch -p1 < /tmp/lifetimes.patch
+patch -p1 < /tmp/relay-neighbors.patch
 # Link the native daemon statically; the router keeps its packaged ubus/UCI ABI.
 sed -i '/project(odhcpd LANGUAGES C)/a set(CMAKE_FIND_LIBRARY_SUFFIXES .a)' CMakeLists.txt
 cmake -S . -B /tmp/odhcpd -DUBUS=ON -DDHCPV4_SUPPORT=OFF \

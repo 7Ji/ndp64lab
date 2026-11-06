@@ -211,7 +211,12 @@ Removed addresses stop refreshing; network and DHCP changes reload the service.
 When a confirmed neighbor's MAC appears on another LAN, the helper immediately
 retires its old kernel neighbor entry. odhcpd then removes stale proxies before
 they can falsely answer the moving client's DAD. Interface-bound probes confirm
-the new location; odhcpd continues to own routes and proxies.
+the new location; odhcpd continues to own routes and proxies. Failed and
+incomplete relay probes are not previous client locations. The helper leaves
+them alone, and odhcpd tracks which confirmed neighbors installed relay state.
+Removing an unsuccessful probe, including through kernel garbage collection,
+cannot tear down another LAN's valid proxies. Acceptance checks create and
+remove failed probes while monitoring proxies and client2-to-client5 traffic.
 
 The separately built ISP-only `/usr/sbin/isp-ndp-learn` receives and validates
 NS packets. Both subscriber learners are supervised inside the ISP container,

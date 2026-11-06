@@ -3,6 +3,7 @@ COPY --from=native-repositories / /
 RUN apk add --no-cache build-base cmake json-c-dev linux-headers
 COPY --from=native-sources / /src/
 COPY build/odhcpd-lifetime-caps.patch /tmp/lifetimes.patch
+COPY build/odhcpd-relay-neighbor-ownership.patch /tmp/relay-neighbors.patch
 COPY build/build-odhcpd.sh /build-odhcpd.sh
 RUN sh /build-odhcpd.sh
 
